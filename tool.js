@@ -5639,8 +5639,39 @@ let motionActivity = 0;
 
 const clock = new THREE.Clock();
 
+// Keep the canvas filling the frame no matter who resized it (Brik's frame /
+// export sizing, late script load, ratio switch). CSS always 100%; the drawing
+// buffer follows the frame unless Brik fixed an export size; the camera aspect
+// always follows the real drawing buffer, so nothing gets cropped or stretched.
+const __sizeV = new THREE.Vector2();
+const __bufV = new THREE.Vector2();
+function syncCanvasSize() {
+  const el = renderer.domElement;
+  if (el.style.width !== '100%') { el.style.width = '100%'; el.style.height = '100%'; }
+  const api = window.CanvasRuntimeAPI;
+  const fixed = !!(api && api.isFixedExportMode && api.isFixedExportMode());
+  if (!fixed) {
+    const w = area.clientWidth, h = area.clientHeight;
+    renderer.getSize(__sizeV);
+    if (w > 0 && h > 0 && (Math.abs(__sizeV.x - w) > 0.5 || Math.abs(__sizeV.y - h) > 0.5)) {
+      renderer.setSize(w, h, false);
+    }
+  }
+  renderer.getDrawingBufferSize(__bufV);
+  if (__bufV.x > 0 && __bufV.y > 0) {
+    const asp = __bufV.x / __bufV.y;
+    if (Math.abs(camera.aspect - asp) > 1e-4) {
+      camera.aspect = asp;
+      camera.updateProjectionMatrix();
+      updateBgUvScale();
+      updateFgUvScale();
+    }
+  }
+}
+
 function animate() {
   requestAnimationFrame(animate);
+  syncCanvasSize();
   const delta = Math.min(clock.getDelta(), 0.1);
   const elapsed = clock.getElapsedTime();
 
