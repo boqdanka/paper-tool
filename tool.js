@@ -10,6 +10,11 @@ const controls = window.ControlsAPI;
 // (yellow -> orange, teal -> dark green).
 THREE.ColorManagement.enabled = false;
 
+// Version stamp — visible in the browser console, so it's easy to see which
+// tool.js Brik actually loaded.
+window.PAPER_TOOL_VERSION = '2026-10-02 · v9 (no card cut-through in steps)';
+console.info('%c[paper-tool] loaded ' + window.PAPER_TOOL_VERSION, 'background:#ffd23f;color:#111;padding:2px 6px;border-radius:3px');
+
 // Setup render area and Three.js scene
 const area = document.querySelector('.tool-canvas-area') || document.body;
 
@@ -6116,23 +6121,29 @@ controls.onChange('backsideColor', (val) => {
         const dirSign = scNum('showcaseStepDirection') < 0 ? -1 : 1;
         // which place this card is heading for (unwrapped)
         const baseSlot = i - (n - 1) / 2;
-        // stagger: every card runs the same hop schedule, shifted by a FIXED
-        // delay along the chain (card order in the chain never changes), so a
-        // big stagger makes a wave instead of jumps
-        const cardClock = scStepClock - Math.max(0, stagger) * (dirSign > 0 ? i : (n - 1 - i));
-        const steps = Math.floor(cardClock / cycle);
-        const local = cardClock - steps * cycle;
-        const eStep = local < moveD ? easeFn(local / moveD) : 1;
+        const hop = Math.max(0.25, scNum('showcaseStepPlaces'));
+        const half = n / 2;
+        const wrapS = (v) => ((v + half) % n + n) % n - half;
+        const hold = Math.max(0, scNum('showcaseStepHold'));
+        const G = Math.floor(scStepClock / cycle);
+        // stagger = a wave along the chain: the card at the FRONT of the chain
+        // moves first, the ones behind follow. The order is taken from where each
+        // card LANDS on this hop, so cards never overtake each other (that was
+        // what made a card cut through its neighbour), and the whole wave fits
+        // inside the hold, so nothing jumps at the start of the next hop.
+        const landing = wrapS(baseSlot - dirSign * (G + 1) * hop);
+        const rankFront = dirSign > 0 ? (landing + half) : (half - landing);
+        const H = hold * 0.95;
+        const delay = Math.min(H, Math.max(0, Math.max(0, stagger) * (rankFront - (n - 1) / 2) + H / 2));
+        const local = scStepClock - G * cycle - delay;
+        const eStep = local <= 0 ? 0 : (local < moveD ? easeFn(local / moveD) : 1);
         // part of the travel is a constant slow glide, so cards never freeze
-        // completely between hops; still exactly one place per cycle
+        // completely between hops; still exactly `hop` places per cycle
         const drift = Math.min(0.6, Math.max(0, scNum('showcaseStepDrift')));
-        const glide = local / cycle;
+        const glide = (scStepClock - G * cycle) / cycle;
         const e = (1 - drift) * eStep + drift * glide;
         // position along the chain, wrapped so the chain loops endlessly
-        const hop = Math.max(0.25, scNum('showcaseStepPlaces'));
-        let sPos = baseSlot - dirSign * (steps + e) * hop;
-        const half = n / 2;
-        sPos = ((sPos + half) % n + n) % n - half;
+        let sPos = wrapS(baseSlot - dirSign * (G + e) * hop);
         const ang = THREE.MathUtils.degToRad(scNum('showcaseStepAngle'));
         const spacing = halfW * 0.55 * scNum('showcaseStepSpacing') * spread;
         x = Math.cos(ang) * sPos * spacing;
@@ -6143,7 +6154,7 @@ controls.onChange('backsideColor', (val) => {
         z = sPos * Math.max(0.02, scNum('showcaseStepGap')) * depth;
         // fade only at the far ends of the loop, where the wrap happens
         const edge = half - Math.abs(sPos);
-        op = Math.min(1, Math.max(0, edge / 0.6));
+        op = Math.min(1, Math.max(0, edge / (0.6 + Math.max(0, hop - 1))));
         cd.slotPos = sPos;
       } else if (motion === 'orbit') {
         // carousel around the title
