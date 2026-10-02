@@ -472,10 +472,14 @@ const foldTween2 = createTweenState(0.0, 1.3);
 let clickPeelStep = 0;
 const peelTween = createTweenState(0.25, 1.4);
 
+let clickCrumpleStep = 0;
+const crumpleTween = createTweenState(0.0, 1.4);
 
 let floatClickWave = 0.0;
 let floatAnimTime = 0.0;
 let autoPeelTime = 0.0;
+let autoCrumpleTime = 0.0;
+let lastAutoCrumpleCycleIdx = -1;
 
 function getIdleTease(tween, time, amplitude = 0.038, freq = 2.4) {
   if (tween.active) return 0.0;
@@ -548,6 +552,15 @@ function handleCanvasClick() {
       const peelable = Math.max(1, numLayers - 1);
       clickPeelStep = (clickPeelStep + 1) % (peelable + 1);
       startTweenTo(peelTween, clickPeelStep / peelable);
+    } else if (mode === 'crumple') {
+      clickCrumpleStep = (clickCrumpleStep + 1) % 3;
+      if (clickCrumpleStep === 0) {
+        startTweenTo(crumpleTween, 0.0);
+      } else if (clickCrumpleStep === 1) {
+        startTweenTo(crumpleTween, 0.55);
+      } else {
+        startTweenTo(crumpleTween, 1.0);
+      }
     } else if (mode === 'float') {
       floatClickWave = 1.0;
     }
@@ -2162,6 +2175,1438 @@ const peelFragmentShader = `
 `;
 
 // =========================================================================
+// 9. CRUMPLED PAPER (Smooth Faceted & Creased Paper Simulation with Seed Morphing)
+// =========================================================================
+const crumpleUniforms = {
+  ...glslCommonUniforms,
+  uTexture: { value: defaultTextures[0] },
+  uDimensions: { value: new THREE.Vector2(2.75, 3.88) },
+  uCrumpleProgress: { value: 0.0 },
+  uCrumpleFoldStrength: { value: 1.0 },
+  uSeedMorph: { value: 0.0 },
+  uWrinkleDensity: { value: 50.0 },
+  uCrumpleSeed: { value: 73.0 },
+  uCrumpleMicroTextureIntensity: { value: 1.0 },
+  uCrumpleMicroTextureSize: { value: 1.2 },
+  uTime: { value: 0.0 },
+};
+
+const crumpleVertexShader = `
+  attribute vec3 aCrumpledPos;
+  attribute vec3 aCrumpledNormal;
+  attribute vec3 aCrumpledPosNext;
+  attribute vec3 aCrumpledNormalNext;
+  
+  uniform vec2 uDimensions;
+  uniform float uCrumpleProgress;
+  uniform float uCrumpleFoldStrength;
+  uniform float uSeedMorph;
+  uniform float uTime;
+  
+  varying vec2 vUv;
+  varying vec3 vWorldPos;
+  varying vec3 vNormal;
+
+  float easeInOutSine(float x) {
+    return -(cos(3.141592653589793 * clamp(x, 0.0, 1.0)) - 1.0) * 0.5;
+  }
+
+  void main() {
+    vUv = clamp(uv, 0.0005, 0.9995);
+    
+    float tProg = clamp(uCrumpleProgress, 0.0, 1.0);
+    // Strength drives the solver (press force), not a raw displacement scale.
+    // Clamping here keeps panels non-stretchable at maximum force.
+    float str = clamp(uCrumpleFoldStrength, 0.0, 1.0);
+    float easedT = easeInOutSine(tProg);
+    float morphT = easeInOutSine(clamp(uSeedMorph, 0.0, 1.0));
+    
+    vec3 blendedCrumplePos = mix(aCrumpledPos, aCrumpledPosNext, morphT);
+    vec3 blendedCrumpleNorm = normalize(mix(aCrumpledNormal, aCrumpledNormalNext, morphT));
+    
+    vec3 targetDisp = (blendedCrumplePos - position) * str;
+    vec3 displaced = position + targetDisp * easedT;
+    
+    vec3 targetNormDelta = (blendedCrumpleNorm - normal) * str;
+    vec3 dispNormal = normalize(normal + targetNormDelta * easedT);
+    
+    vec4 worldPos = modelMatrix * vec4(displaced, 1.0);
+    vWorldPos = worldPos.xyz;
+    vNormal = normalize(normalMatrix * dispNormal);
+    gl_Position = projectionMatrix * viewMatrix * worldPos;
+  }
+`;
+
+const crumpleFragmentShader = `
+  uniform sampler2D uTexture;
+  uniform vec2 uDimensions;
+  uniform float uCrumpleProgress;
+  uniform float uCrumpleFoldStrength;
+  uniform float uCrumpleMicroTextureIntensity;
+  uniform float uCrumpleMicroTextureSize;
+  
+  varying vec2 vUv;
+  varying vec3 vWorldPos;
+  varying vec3 vNormal;
+  
+  ${glslPaperHeader}
+  
+  vec2 crumpleHash22(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * vec3(443.897, 441.423, 437.195));
+    p3 += dot(p3, p3.yzx + 19.19);
+    return fract((p3.xx + p3.yz) * p3.zy);
+  }
+
+  float evalMicroWrinkleOctave(vec2 p, float sharpness, out float outRidge, out float outCrevice) {
+    vec2 n = floor(p);
+    vec2 f = fract(p);
+
+    float md1 = 8.0;
+    vec2 mr, mg;
+
+    for (int j = -1; j <= 1; j++) {
+      for (int k = -1; k <= 1; k++) {
+        vec2 g = vec2(float(k), float(j));
+        vec2 o = crumpleHash22(n + g) * 0.70 + 0.15;
+        vec2 r = g + o - f;
+        float d = dot(r, r);
+        if (d < md1) {
+          md1 = d;
+          mr = r;
+          mg = g;
+        }
+      }
+    }
+
+    float md2 = 8.0;
+    for (int j = -2; j <= 2; j++) {
+      for (int k = -2; k <= 2; k++) {
+        vec2 g = mg + vec2(float(k), float(j));
+        vec2 o = crumpleHash22(n + g) * 0.70 + 0.15;
+        vec2 r = g + o - f;
+        if (dot(mr - r, mr - r) > 0.00001) {
+          float d = dot(0.5 * (mr + r), normalize(r - mr));
+          md2 = min(md2, d);
+        }
+      }
+    }
+
+    float edgeDist = max(0.0, md2);
+    float ridge = exp(-edgeDist * sharpness);
+    float facet = clamp(1.0 - edgeDist * 1.5, 0.0, 1.0);
+    facet = facet * facet * (3.0 - 2.0 * facet);
+
+    outRidge = ridge;
+    outCrevice = clamp(1.0 - ridge * 0.85, 0.0, 1.0);
+
+    return ridge * 0.70 + facet * 0.30;
+  }
+
+  void main() {
+    vec3 dX = dFdx(vWorldPos);
+    vec3 dY = dFdy(vWorldPos);
+    vec3 crossN = cross(dX, dY);
+    vec3 geomNormal = (length(crossN) > 0.0001) ? normalize(crossN) : normalize(vNormal);
+    if (!gl_FrontFacing) geomNormal = -geomNormal;
+    
+    vec3 vertNormal = normalize(vNormal);
+    if (!gl_FrontFacing) vertNormal = -vertNormal;
+    // Flat shading: sharp facets, no smoothing across creases
+    vec3 blendedNormal = geomNormal;
+    
+    float prog = clamp(uCrumpleProgress, 0.0, 1.0);
+    float foldStr = max(0.0, uCrumpleFoldStrength);
+    
+    vec4 texColor = texture2D(uTexture, vUv);
+    vec3 paperBase = sRGBToLinear(vec3(0.97, 0.97, 0.97));
+    // Back faces = blank paper stock, no poster, no bleed-through
+    vec3 baseAlbedo = gl_FrontFacing
+      ? mix(paperBase, sRGBToLinear(texColor.rgb), texColor.a)
+      : paperBase * 0.97;
+
+    // Large Fold Pattern: panels are perfectly flat — no micro relief at all.
+    float ridgeLift = 0.0;
+    float creviceAo = 0.0;
+
+    vec3 color = renderPaperMaterial(
+      texColor.rgb,
+      baseAlbedo,
+      blendedNormal,
+      blendedNormal,
+      vUv,
+      uDimensions,
+      vWorldPos,
+      cameraPosition,
+      uGrainIntensity,
+      uRoughness,
+      uKeyLightIntensity,
+      uFillLightIntensity,
+      uKeyLightPos,
+      uFillLightPos,
+      0.0,
+      creviceAo * 0.45
+    );
+    
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+
+function generateLegacyCrumpleData(w, h, densityRaw, seed) {
+  const densityNorm = Math.min(1.0, Math.max(0.0, (densityRaw - 1.0) / 49.0));
+  const rng = makeSeededRng(seed);
+  const minDim = Math.min(w, h);
+
+  function getPerimeterPoint(side, t) {
+    const clampedT = Math.max(0.04, Math.min(0.96, t));
+    if (side === 0) return { x: -w * 0.5 + clampedT * w, y: h * 0.5 };   // Top
+    if (side === 1) return { x: w * 0.5, y: h * 0.5 - clampedT * h };   // Right
+    if (side === 2) return { x: w * 0.5 - clampedT * w, y: -h * 0.5 };  // Bottom
+    return { x: -w * 0.5, y: -h * 0.5 + clampedT * h };                 // Left
+  }
+
+  // 1. Generate 5 to 9 Major Edge-to-Edge Diagonal & Transverse Creases
+  const numMajor = Math.max(5, Math.min(9, Math.round(5 + densityNorm * 4)));
+  const creaseLines = [];
+
+  for (let i = 0; i < numMajor; i++) {
+    const sideA = (i * 2 + Math.floor(rng() * 2)) % 4;
+    const sideB = (sideA + 1 + Math.floor(rng() * 3)) % 4;
+
+    const pA = getPerimeterPoint(sideA, 0.10 + rng() * 0.80);
+    const pB = getPerimeterPoint(sideB, 0.10 + rng() * 0.80);
+
+    const vx = pB.x - pA.x;
+    const vy = pB.y - pA.y;
+    const len = Math.hypot(vx, vy) || 1.0;
+    const dirX = vx / len;
+    const dirY = vy / len;
+    const normX = -dirY;
+    const normY = dirX;
+
+    const width = minDim * (0.045 + rng() * 0.055);
+    const depth = minDim * (0.13 + rng() * 0.18);
+    const step = minDim * (0.045 + rng() * 0.075) * (rng() > 0.5 ? 1.0 : -1.0);
+    const tilt = (rng() - 0.5) * 0.22;
+    const sign = (i % 2 === 0 ? 1.0 : -1.0) * (rng() > 0.35 ? 1.0 : -1.0);
+    const contract = 0.05 + rng() * 0.06;
+
+    creaseLines.push({
+      pAx: pA.x, pAy: pA.y,
+      pBx: pB.x, pBy: pB.y,
+      dirX, dirY,
+      normX, normY,
+      len,
+      width, depth, step, tilt,
+      sign, contract
+    });
+  }
+
+  // 2. Generate Secondary Branching Crease Network (Y-junctions & Origami facets)
+  const numSecondary = Math.max(4, Math.min(8, Math.round(3 + densityNorm * 5)));
+  for (let j = 0; j < numSecondary; j++) {
+    const parent = creaseLines[Math.floor(rng() * creaseLines.length)];
+    const tFrac = 0.15 + rng() * 0.70;
+    const startX = parent.pAx + parent.dirX * (parent.len * tFrac);
+    const startY = parent.pAy + parent.dirY * (parent.len * tFrac);
+
+    const branchAngle = (rng() > 0.5 ? 1 : -1) * (0.55 + rng() * 0.75);
+    const cosB = Math.cos(branchAngle);
+    const sinB = Math.sin(branchAngle);
+    const bDirX = parent.dirX * cosB - parent.dirY * sinB;
+    const bDirY = parent.dirX * sinB + parent.dirY * cosB;
+
+    const bLen = minDim * (0.22 + rng() * 0.45);
+    const endX = startX + bDirX * bLen;
+    const endY = startY + bDirY * bLen;
+
+    const width = minDim * (0.035 + rng() * 0.045);
+    const depth = minDim * (0.08 + rng() * 0.13);
+    const step = minDim * (0.025 + rng() * 0.045) * (rng() > 0.5 ? 1.0 : -1.0);
+    const tilt = (rng() - 0.5) * 0.15;
+    const sign = rng() > 0.5 ? 1.0 : -1.0;
+    const contract = 0.04 + rng() * 0.05;
+
+    creaseLines.push({
+      pAx: startX, pAy: startY,
+      pBx: endX, pBy: endY,
+      dirX: bDirX, dirY: bDirY,
+      normX: -bDirY, normY: bDirX,
+      len: bLen,
+      width, depth, step, tilt,
+      sign, contract
+    });
+  }
+
+  // 3. Facet Region Generator (Voronoi Polygons with Planar Tilts)
+  const numSites = Math.max(16, Math.min(28, Math.round(14 + densityNorm * 12)));
+  const sites = [];
+  for (let s = 0; s < numSites; s++) {
+    const sx = (rng() - 0.5) * w * 1.08;
+    const sy = (rng() - 0.5) * h * 1.08;
+    const zBase = (rng() - 0.5) * minDim * 0.14;
+    const tiltX = (rng() - 0.5) * 0.16;
+    const tiltY = (rng() - 0.5) * 0.16;
+    sites.push({ x: sx, y: sy, zBase, tiltX, tiltY });
+  }
+
+  // 4. Corner & Edge Dog-Ear Flaps (Acute folded paper flaps as on reference)
+  const cornerFolds = [];
+  const cornerPresets = [
+    { cx: -w * 0.5, cy: h * 0.5,  dirX: 0.7071,  dirY: -0.7071 }, // Top-Left
+    { cx: w * 0.5,  cy: h * 0.5,  dirX: -0.7071, dirY: -0.7071 }, // Top-Right
+    { cx: w * 0.5,  cy: -h * 0.5, dirX: -0.7071, dirY: 0.7071 },  // Bottom-Right
+    { cx: -w * 0.5, cy: -h * 0.5, dirX: 0.7071,  dirY: 0.7071 }   // Bottom-Left
+  ];
+  const numFlaps = rng() > 0.35 ? 2 : 1;
+  const pickedFlaps = [0, 2];
+  if (numFlaps === 1) pickedFlaps.pop();
+
+  for (const cIdx of pickedFlaps) {
+    const cp = cornerPresets[cIdx];
+    const foldDist = minDim * (0.16 + rng() * 0.18);
+    const foldAngle = (rng() - 0.5) * 0.40;
+    const cosA = Math.cos(foldAngle);
+    const sinA = Math.sin(foldAngle);
+    const rDirX = cp.dirX * cosA - cp.dirY * sinA;
+    const rDirY = cp.dirX * sinA + cp.dirY * cosA;
+
+    cornerFolds.push({
+      cornerX: cp.cx,
+      cornerY: cp.cy,
+      dirX: rDirX,
+      dirY: rDirY,
+      normX: -rDirY,
+      normY: rDirX,
+      foldDist,
+      liftAmount: minDim * (0.10 + rng() * 0.12) * (rng() > 0.4 ? 1.0 : -0.7)
+    });
+  }
+
+  const cols = 144;
+  const rows = Math.max(144, Math.round(cols / (currentAspect || 0.707)));
+
+  const numVertices = (cols + 1) * (rows + 1);
+  const restPositions = new Float32Array(numVertices * 3);
+  const crumpledPositions = new Float32Array(numVertices * 3);
+  const uvs = new Float32Array(numVertices * 2);
+
+  let sumX = 0, sumY = 0, sumZ = 0;
+
+  for (let iy = 0; iy <= rows; iy++) {
+    const vNorm = iy / rows;
+    for (let ix = 0; ix <= cols; ix++) {
+      const uNorm = ix / cols;
+      const idx = iy * (cols + 1) + ix;
+
+      const px = -w * 0.5 + uNorm * w;
+      const py = h * 0.5 - vNorm * h;
+
+      restPositions[idx * 3] = px;
+      restPositions[idx * 3 + 1] = py;
+      restPositions[idx * 3 + 2] = 0.0;
+
+      uvs[idx * 2] = Math.max(0.0005, Math.min(0.9995, uNorm));
+      uvs[idx * 2 + 1] = Math.max(0.0005, Math.min(0.9995, 1.0 - vNorm));
+
+      let dispX = 0.0;
+      let dispY = 0.0;
+      let dispZ = 0.0;
+
+      // 1. Voronoi Facet Network Computation
+      let d1 = 1e9, d2 = 1e9;
+      let s1 = sites[0], s2 = sites[1];
+      for (let s = 0; s < sites.length; s++) {
+        const d = Math.hypot(px - sites[s].x, py - sites[s].y);
+        if (d < d1) {
+          d2 = d1;
+          s2 = s1;
+          d1 = d;
+          s1 = sites[s];
+        } else if (d < d2) {
+          d2 = d;
+          s2 = sites[s];
+        }
+      }
+
+      const h1 = s1.zBase + s1.tiltX * (px - s1.x) + s1.tiltY * (py - s1.y);
+      const h2 = s2.zBase + s2.tiltX * (px - s2.x) + s2.tiltY * (py - s2.y);
+      const deltaD = Math.max(0.0, d2 - d1);
+      const tFacet = Math.min(1.0, deltaD / (minDim * 0.08));
+      const facetZ = h2 + (h1 - h2) * (tFacet * tFacet * (3.0 - 2.0 * tFacet));
+      dispZ += facetZ * 0.75;
+
+      // 2. Major & Branching Crease Network
+      for (let f = 0; f < creaseLines.length; f++) {
+        const cl = creaseLines[f];
+        const dx = px - cl.pAx;
+        const dy = py - cl.pAy;
+
+        const sDist = dx * cl.normX + dy * cl.normY;
+        const tDist = dx * cl.dirX + dy * cl.dirY;
+
+        const absS = Math.abs(sDist);
+
+        let tTaper = 1.0;
+        if (tDist < 0) {
+          tTaper = Math.max(0.0, 1.0 + tDist / (cl.width * 2.5));
+        } else if (tDist > cl.len) {
+          tTaper = Math.max(0.0, 1.0 - (tDist - cl.len) / (cl.width * 2.5));
+        }
+
+        if (tTaper > 0.001) {
+          const uS = absS / cl.width;
+          if (uS < 2.5) {
+            const ridgeShape = Math.exp(-uS * 1.6) * (1.0 - uS * 0.20);
+            dispZ += cl.depth * cl.sign * ridgeShape * tTaper;
+
+            const sSign = sDist >= 0 ? 1.0 : -1.0;
+            const pull = -sSign * (cl.depth * cl.contract) * (uS * Math.exp(-uS * 1.2)) * tTaper;
+            dispX += pull * cl.normX;
+            dispY += pull * cl.normY;
+          }
+
+          const stepTransition = Math.tanh(sDist / (cl.width * 0.60));
+          dispZ += cl.step * stepTransition * tTaper;
+
+          const slopeFade = Math.exp(-absS / (minDim * 0.50));
+          dispZ += cl.tilt * sDist * slopeFade * tTaper;
+        }
+      }
+
+      // 3. Corner Dog-Ear Flaps
+      for (let c = 0; c < cornerFolds.length; c++) {
+        const cf = cornerFolds[c];
+        const cdx = px - cf.cornerX;
+        const cdy = py - cf.cornerY;
+        const proj = cdx * cf.dirX + cdy * cf.dirY;
+
+        if (proj < cf.foldDist && proj > 0.0) {
+          const tFold = 1.0 - proj / cf.foldDist;
+          const foldHeight = Math.pow(tFold, 1.35) * cf.liftAmount;
+          dispZ += foldHeight;
+
+          dispX += -cf.dirX * (foldHeight * 0.40);
+          dispY += -cf.dirY * (foldHeight * 0.40);
+        }
+      }
+
+      // 4. Subtle edge wave
+      const edgeDistX = Math.abs(px) / (w * 0.5);
+      const edgeDistY = Math.abs(py) / (h * 0.5);
+      const edgeFactor = Math.max(edgeDistX, edgeDistY);
+      if (edgeFactor > 0.85) {
+        const eT = (edgeFactor - 0.85) / 0.15;
+        const edgeWarp = Math.sin(px * 10.0 + py * 10.0 + seed * 0.3) * (0.009 * minDim) * eT;
+        dispZ += edgeWarp;
+      }
+
+      const finalX = px + dispX;
+      const finalY = py + dispY;
+      const finalZ = dispZ;
+
+      crumpledPositions[idx * 3] = finalX;
+      crumpledPositions[idx * 3 + 1] = finalY;
+      crumpledPositions[idx * 3 + 2] = finalZ;
+
+      sumX += finalX;
+      sumY += finalY;
+      sumZ += finalZ;
+    }
+  }
+
+  const count = (cols + 1) * (rows + 1);
+  const avgX = sumX / count;
+  const avgY = sumY / count;
+  const avgZ = sumZ / count;
+
+  for (let i = 0; i < count; i++) {
+    crumpledPositions[i * 3] -= avgX;
+    crumpledPositions[i * 3 + 1] -= avgY;
+    crumpledPositions[i * 3 + 2] -= avgZ;
+  }
+
+  const indices = [];
+  for (let iy = 0; iy < rows; iy++) {
+    for (let ix = 0; ix < cols; ix++) {
+      const v00 = iy * (cols + 1) + ix;
+      const v10 = v00 + 1;
+      const v01 = (iy + 1) * (cols + 1) + ix;
+      const v11 = v01 + 1;
+
+      indices.push(v00, v01, v10);
+      indices.push(v10, v01, v11);
+    }
+  }
+
+  const tempGeo = new THREE.BufferGeometry();
+  tempGeo.setAttribute('position', new THREE.BufferAttribute(crumpledPositions.slice(), 3));
+  tempGeo.setIndex(indices);
+  tempGeo.computeVertexNormals();
+  const crumpledNormals = tempGeo.getAttribute('normal').array;
+
+  return {
+    restPositions,
+    crumpledPositions,
+    crumpledNormals,
+    uvs,
+    indices
+  };
+}
+
+// -------------------------------------------------------------------------
+// VELLUM PAPER XPBD SOLVER
+//  - hard distance constraints (zero stretch / rest-length conservation)
+//  - bending constraints with PLASTIC rest-angle update past ~15 deg
+//  - Voronoi crease map: bending is compliant only on cell edges
+//  - shrinking box collider (6-sided press) + spatial-hash self-collision
+//  - flat-shaded facet normals
+// -------------------------------------------------------------------------
+function generateOrganicCrumpleData(w, h, densityRaw, seed, strengthRaw = 1.0) {
+  const densityNorm = Math.min(1.0, Math.max(0.0, (densityRaw - 1.0) / 49.0));
+  // 0 .. 1 normalized press force (slider goes 0..2)
+  const forceN = Math.min(1.0, Math.max(0.0, strengthRaw / 2.0));
+  const rng = makeSeededRng(seed + 0.137);
+  const minDim = Math.min(w, h);
+
+  const cols = 42;
+  const rows = Math.max(30, Math.min(64, Math.round(cols * (h / w))));
+  const NX = cols + 1;
+  const NY = rows + 1;
+  const N = NX * NY;
+  const sx = w / cols;
+  const sy = h / rows;
+  const spacing = Math.min(sx, sy);
+
+  const restPositions = new Float32Array(N * 3);
+  const uvs = new Float32Array(N * 2);
+  const pos = new Float32Array(N * 3);
+  const prev = new Float32Array(N * 3);
+
+  // ---- Voronoi crease map (jittered, anisotropic, multi-scale cells) ----
+  // Stratified jitter grid -> uneven cell shapes; per-site radius weight mixes
+  // large flat panels with clusters of small facets. Anisotropy stretches cells
+  // along a random axis so creases read as long diagonals, not a honeycomb.
+  // Stratified (jittered) grid of sites: guarantees EVEN coverage of the whole
+  // sheet — every region gets a comparable number of creases — while the jitter,
+  // per-site rotation and mild anisotropy keep the network irregular/asymmetric.
+  const aspectWH = w / h;
+  const targetCells = 4 + Math.round(densityNorm * 6);
+  let gx = Math.max(2, Math.round(Math.sqrt(targetCells * aspectWH)));
+  let gy = Math.max(2, Math.round(targetCells / gx));
+  const numSites = gx * gy;
+  const siteX = new Float32Array(numSites);
+  const siteY = new Float32Array(numSites);
+  const siteSg = new Float32Array(numSites);
+  const siteWt = new Float32Array(numSites);   // radius weight (cell size)
+  const siteCos = new Float32Array(numSites);
+  const siteSin = new Float32Array(numSites);
+  const siteAni = new Float32Array(numSites);  // anisotropy factor
+  const siteSharp = new Float32Array(numSites);
+  const siteOn = new Float32Array(numSites);   // seed-driven active subset
+
+  let si = 0;
+  for (let j = 0; j < gy; j++) {
+    for (let i2 = 0; i2 < gx; i2++) {
+      // jitter inside each stratum -> irregular, non-symmetric cells,
+      // but density per unit area stays constant across the sheet
+      const jitter = 0.85;
+      const ux = (i2 + 0.5 + (rng() - 0.5) * jitter) / gx;
+      const uy = (j + 0.5 + (rng() - 0.5) * jitter) / gy;
+      siteX[si] = (ux - 0.5) * w * 1.06;
+      siteY[si] = (uy - 0.5) * h * 1.06;
+      siteSg[si] = rng() > 0.5 ? 1.0 : -1.0;
+      // near-uniform cell weight: no clustering of tiny facets in one region
+      siteWt[si] = 0.94 + rng() * 0.12;
+      const a = rng() * Math.PI;
+      siteCos[si] = Math.cos(a);
+      siteSin[si] = Math.sin(a);
+      siteAni[si] = 1.15 + rng() * 0.75;
+      // some creases crisp, some soft
+      siteSharp[si] = 0.55 + rng() * 0.45;
+      // ACTIVE / DISABLED grid points: the seed decides which subset of the
+      // crease network can fold at all. Disabled sites keep their boundary rigid.
+      siteOn[si] = rng() < 0.62 ? 1.0 : 0.0;
+      si++;
+    }
+  }
+
+  const creaseW = new Float32Array(N);   // 1 = on a crease line
+  const cellSign = new Float32Array(N);  // mountain / valley bias
+  const creaseSharp = new Float32Array(N);
+  const creaseBand = minDim * 0.015;
+
+  for (let iy = 0; iy < NY; iy++) {
+    const vN = iy / rows;
+    for (let ix = 0; ix < NX; ix++) {
+      const uN = ix / cols;
+      const i = iy * NX + ix;
+      const px = -w * 0.5 + uN * w;
+      const py = h * 0.5 - vN * h;
+
+      restPositions[i * 3] = px;
+      restPositions[i * 3 + 1] = py;
+      restPositions[i * 3 + 2] = 0.0;
+      uvs[i * 2] = Math.max(0.0005, Math.min(0.9995, uN));
+      uvs[i * 2 + 1] = Math.max(0.0005, Math.min(0.9995, 1.0 - vN));
+
+      let d1 = 1e9, d2 = 1e9, sg = 1.0, sh = 0.5;
+      let a1 = 1.0, a2 = 1.0;
+      for (let s = 0; s < numSites; s++) {
+        const dx0 = px - siteX[s];
+        const dy0 = py - siteY[s];
+        // rotate into site frame, stretch one axis (anisotropic cells)
+        const rx = (dx0 * siteCos[s] + dy0 * siteSin[s]) / siteAni[s];
+        const ry = (-dx0 * siteSin[s] + dy0 * siteCos[s]) * 0.85;
+        const d = Math.sqrt(rx * rx + ry * ry) / siteWt[s];
+        if (d < d1) { d2 = d1; a2 = a1; d1 = d; sg = siteSg[s]; sh = siteSharp[s]; a1 = siteOn[s]; }
+        else if (d < d2) { d2 = d; a2 = siteOn[s]; }
+      }
+      const edgeDist = Math.max(0.0, d2 - d1);
+      // sharper sites -> tighter crease band, softer sites -> broad round fold
+      const band = creaseBand * (1.25 - sh * 0.70);
+      // an edge only folds if BOTH neighbouring grid points are active
+      const activeGate = (a1 > 0.5 && a2 > 0.5) ? 1.0 : 0.0;
+      creaseW[i] = Math.exp(-edgeDist / band) * activeGate;
+      cellSign[i] = sg;
+      creaseSharp[i] = sh;
+
+      // seed buckling: cells lift/dip slightly so folds nucleate on cell edges
+      const z0 = sg * minDim * 0.020 * (1.0 - creaseW[i]);
+      pos[i * 3] = px;
+      pos[i * 3 + 1] = py;
+      pos[i * 3 + 2] = z0;
+      prev[i * 3] = px;
+      prev[i * 3 + 1] = py;
+      prev[i * 3 + 2] = z0;
+    }
+  }
+
+  // ---- Distance constraints (rigid edges: stretch resistance 100%) ----
+  const dA = [], dB = [], dRest = [], dK = [];
+  function addDist(a, b, k) {
+    const dx = restPositions[a * 3] - restPositions[b * 3];
+    const dy = restPositions[a * 3 + 1] - restPositions[b * 3 + 1];
+    dA.push(a); dB.push(b); dRest.push(Math.hypot(dx, dy)); dK.push(k);
+  }
+  for (let iy = 0; iy < NY; iy++) {
+    for (let ix = 0; ix < NX; ix++) {
+      const i = iy * NX + ix;
+      if (ix < NX - 1) addDist(i, i + 1, 1.0);
+      if (iy < NY - 1) addDist(i, i + NX, 1.0);
+      if (ix < NX - 1 && iy < NY - 1) {
+        addDist(i, i + NX + 1, 0.85);
+        addDist(i + 1, i + NX, 0.85);
+      }
+    }
+  }
+  const dCount = dA.length;
+  const dAi = Int32Array.from(dA), dBi = Int32Array.from(dB);
+  const dRestF = Float32Array.from(dRest), dKF = Float32Array.from(dK);
+
+  // ---- Bending constraints (3-point) with plastic rest length ----
+  const bA = [], bB = [], bC = [], bRest = [], bK = [], bP = [];
+  function addBend(a, c, b) {
+    // a --- c --- b  (c = hinge vertex)
+    const dx = restPositions[a * 3] - restPositions[b * 3];
+    const dy = restPositions[a * 3 + 1] - restPositions[b * 3 + 1];
+    const L = Math.hypot(dx, dy);
+    const cr = creaseW[c];
+    const sh = creaseSharp[c];
+    // rigid everywhere, compliant only along Voronoi crease edges;
+    // sharp creases go fully limp, soft ones keep some spring
+    // vellum: near-rigid panels, hinge compliance ONLY on crease lines
+    const k = 1.0 - (0.92 + 0.075 * sh) * cr;
+    // per-edge plastic threshold: creases lock permanently past ~7-14 deg
+    const degThr = 26.0 - sh * 8.0;
+    bA.push(a); bB.push(b); bC.push(c); bRest.push(L); bK.push(k);
+    bP.push(Math.cos(Math.PI * (degThr * 0.5) / 180.0));
+  }
+  for (let iy = 0; iy < NY; iy++) {
+    for (let ix = 1; ix < NX - 1; ix++) {
+      const i = iy * NX + ix;
+      addBend(i - 1, i, i + 1);
+    }
+  }
+  for (let iy = 1; iy < NY - 1; iy++) {
+    for (let ix = 0; ix < NX; ix++) {
+      const i = iy * NX + ix;
+      addBend(i - NX, i, i + NX);
+    }
+  }
+  const bCount = bA.length;
+  const bAi = Int32Array.from(bA), bBi = Int32Array.from(bB), bCi = Int32Array.from(bC);
+  const bRestF = Float32Array.from(bRest), bKF = Float32Array.from(bK);
+  const bPlast = Float32Array.from(bP);
+  const PLASTIC_RATE = 0.88;
+
+  // ---- Fixed invisible sphere: gravity centre + hard core ----
+  // Radius derived from sheet AREA so the sheet is always big enough to wrap it
+  // completely: 4piR^2 * 3 (slack for folds) = w*h  ->  R = sqrt(w*h / 12pi).
+  // It NEVER changes with any control. Force only drives the pull strength.
+  const coreR = Math.sqrt((w * h) / (12.0 * Math.PI));
+  const coreR2 = coreR * coreR;
+
+  // ---- (legacy press params removed: the solve is pure spherical attraction) ----
+  /* legacy notes
+  // Planar press: a flat platen squeezes mostly along Z, lateral walls only
+  // close in a little. A radial/spherical squeeze is what balled the sheet up,
+  // so lateral travel stays small even at maximum force.
+  // At the very top of the force range the platen gives way to an isotropic
+  // squeeze: the sheet is driven into a shrinking sphere so it wraps onto
+  // itself as a faceted ball (rigid edges + plastic creases keep it flat-panelled,
+  // it is NOT a smooth radial blob).
+  const ballT = Math.max(0.0, Math.min(1.0, (forceN - 0.55) / 0.45));
+  const ballE = ballT * ballT * (3.0 - 2.0 * ballT);
+  // Core radius sized from SHEET AREA, not eyeballed: a sphere of radius R has
+  // surface 4piR^2, so for the sheet (w*h) to wrap it COMPLETELY with slack for
+  // folds we need w*h >= ~3x that. Solve R = sqrt(w*h / (3 * 4pi)).
+  const wrapR = Math.sqrt((w * h) / (12.0 * Math.PI));
+  const ballR = wrapR * (1.02 - ballE * 0.10);
+
+  const planarHz = minDim * (0.105 - forceN * 0.045);
+  const planarShrink = (0.90 - densityNorm * 0.04) - forceN * 0.10;
+  const ballLateral = ballR / (Math.max(w, h) * 0.5);
+
+  // invisible inner core the sheet wraps around; scales with press force
+  let innerRTarget = minDim * (0.02 + forceN * 0.22);
+  // the wrap core must stay well inside the confining ball, otherwise the two
+  // colliders fight and the sheet can never close over the top of the core
+  if (ballE > 0.001) {
+    const maxCore = ballR * (0.72 - ballE * 0.14);
+    innerRTarget = innerRTarget + (Math.min(innerRTarget, maxCore) - innerRTarget) * ballE;
+  }
+
+  const hzTargetRaw = planarHz + (ballR - planarHz) * ballE;
+  // the platen must never squash below the core, otherwise the two colliders fight
+  const hzTarget = Math.max(hzTargetRaw, innerRTarget * 1.06);
+  */
+
+  // ---- Self collision spatial hash ----
+  const thickness = spacing * 0.85;
+  const cellSize = thickness;
+  const invCell = 1.0 / cellSize;
+  // Uniform spatial hash on typed arrays (counting sort, no allocations per call)
+  const TABLE = 1 << 13;
+  const TABLE_MASK = TABLE - 1;
+  const cellStart = new Int32Array(TABLE + 1);
+  const cellEntries = new Int32Array(N);
+  const cellIdx = new Int32Array(N);
+
+  function hashCell(cx, cy, cz) {
+    return (((cx * 92837111) ^ (cy * 689287499) ^ (cz * 283923481)) & TABLE_MASK);
+  }
+
+  // paper-on-paper contact spawns a NEW crease at the contact region
+  const contactFlag = new Uint8Array(N);
+
+  function spawnContactCreases() {
+    let any = false;
+    for (let c = 0; c < bCount; c++) {
+      const hinge = bCi[c];
+      if (contactFlag[hinge] && bKF[c] > 0.12) {
+        bKF[c] *= 0.35;
+        any = true;
+      }
+    }
+    if (any) contactFlag.fill(0);
+  }
+
+  function solveSelfCollision() {
+    cellStart.fill(0);
+    for (let i = 0; i < N; i++) {
+      const i3 = i * 3;
+      const k = hashCell(
+        Math.floor(pos[i3] * invCell),
+        Math.floor(pos[i3 + 1] * invCell),
+        Math.floor(pos[i3 + 2] * invCell)
+      );
+      cellIdx[i] = k;
+      cellStart[k]++;
+    }
+    let acc = 0;
+    for (let k = 0; k < TABLE; k++) { const c = cellStart[k]; cellStart[k] = acc; acc += c; }
+    cellStart[TABLE] = acc;
+    const cursor = cellStart.slice(0, TABLE);
+    for (let i = 0; i < N; i++) cellEntries[cursor[cellIdx[i]]++] = i;
+
+    for (let i = 0; i < N; i++) {
+      const i3 = i * 3;
+      const px = pos[i3], py = pos[i3 + 1], pz = pos[i3 + 2];
+      const cx = Math.floor(px * invCell), cy = Math.floor(py * invCell), cz = Math.floor(pz * invCell);
+      const ixi = i % NX, iyi = (i - ixi) / NX;
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let oz = -1; oz <= 1; oz++) {
+            const k = hashCell(cx + ox, cy + oy, cz + oz);
+            const s0 = cellStart[k];
+            const s1 = cellStart[k + 1];
+            for (let n = s0; n < s1; n++) {
+              const j = cellEntries[n];
+              if (j <= i) continue;
+              const ixj = j % NX, iyj = (j - ixj) / NX;
+              if (Math.abs(ixi - ixj) <= 2 && Math.abs(iyi - iyj) <= 2) continue;
+              const j3 = j * 3;
+              let vx = pos[j3] - px;
+              let vy = pos[j3 + 1] - py;
+              let vz = pos[j3 + 2] - pz;
+              const dsq = vx * vx + vy * vy + vz * vz;
+              if (dsq > 0.0000001 && dsq < thickness * thickness) {
+                const d = Math.sqrt(dsq);
+                const corr = (thickness - d) * 0.5 / d;
+                vx *= corr; vy *= corr; vz *= corr;
+                pos[i3] -= vx; pos[i3 + 1] -= vy; pos[i3 + 2] -= vz;
+                pos[j3] += vx; pos[j3 + 1] += vy; pos[j3 + 2] += vz;
+                contactFlag[i] = 1; contactFlag[j] = 1;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Solve ----
+  const STEPS = 40 + Math.round(forceN * 32);
+  // more Gauss-Seidel passes at high force = harder stretch constraint
+  const ITERS = 4 + Math.round(forceN * 4);
+  const DAMP = 0.86;
+
+  for (let step = 0; step < STEPS; step++) {
+    const t = step / (STEPS - 1);
+    const ease = -(Math.cos(Math.PI * t) - 1.0) * 0.5;
+
+    // GRAVITY toward the centre of the invisible sphere. This is the ONLY
+    // driving force — no shrinking collider, no platen. Every vertex is pulled
+    // with the same relative strength, so the centre folds as much as the edges.
+    // F = normalize(Center - Vi) * Strength — identical magnitude for EVERY
+    // vertex, so the sheet presses in from all 360 degrees at once.
+    const g = coreR * (0.030 + forceN * 0.075) * ease;
+    for (let i = 0; i < N; i++) {
+      const i3 = i * 3;
+      const vx = (pos[i3] - prev[i3]) * DAMP;
+      const vy = (pos[i3 + 1] - prev[i3 + 1]) * DAMP;
+      const vz = (pos[i3 + 2] - prev[i3 + 2]) * DAMP;
+      prev[i3] = pos[i3]; prev[i3 + 1] = pos[i3 + 1]; prev[i3 + 2] = pos[i3 + 2];
+
+      const x = pos[i3], y = pos[i3 + 1], z = pos[i3 + 2];
+      const d = Math.sqrt(x * x + y * y + z * z) || 1e-6;
+      const nx = x / d, ny = y / d, nz = z / d;
+      pos[i3] = x + vx - nx * g;
+      pos[i3 + 1] = y + vy - ny * g;
+      // tiny buckling bias so folds nucleate on ACTIVE crease lines only
+      pos[i3 + 2] = z + vz - nz * g
+        + cellSign[i] * creaseW[i] * spacing * 0.030 * ease;
+    }
+
+    for (let it = 0; it < ITERS; it++) {
+      // rigid distance constraints
+      for (let c = 0; c < dCount; c++) {
+        const a = dAi[c] * 3, b = dBi[c] * 3;
+        let vx = pos[b] - pos[a];
+        let vy = pos[b + 1] - pos[a + 1];
+        let vz = pos[b + 2] - pos[a + 2];
+        const d = Math.hypot(vx, vy, vz);
+        if (d < 0.000001) continue;
+        const diff = (d - dRestF[c]) / d * 0.5 * dKF[c];
+        vx *= diff; vy *= diff; vz *= diff;
+        pos[a] += vx; pos[a + 1] += vy; pos[a + 2] += vz;
+        pos[b] -= vx; pos[b + 1] -= vy; pos[b + 2] -= vz;
+      }
+      // plastic bending
+      for (let c = 0; c < bCount; c++) {
+        const a = bAi[c] * 3, b = bBi[c] * 3;
+        let vx = pos[b] - pos[a];
+        let vy = pos[b + 1] - pos[a + 1];
+        let vz = pos[b + 2] - pos[a + 2];
+        const d = Math.hypot(vx, vy, vz);
+        if (d < 0.000001) continue;
+        let rest = bRestF[c];
+        // past 15 deg of bend -> permanent crease (rest angle follows)
+        if (d < rest * bPlast[c]) {
+          rest += (d - rest) * PLASTIC_RATE;
+          bRestF[c] = rest;
+        }
+        const diff = (d - rest) / d * 0.5 * bKF[c];
+        vx *= diff; vy *= diff; vz *= diff;
+        pos[a] += vx; pos[a + 1] += vy; pos[a + 2] += vz;
+        pos[b] -= vx; pos[b + 1] -= vy; pos[b + 2] -= vz;
+      }
+      // FIXED invisible sphere: hard, non-penetrable core of constant radius.
+      // Paper drapes over it; it never shrinks or grows.
+      for (let i = 0; i < N; i++) {
+        const i3 = i * 3;
+        const x = pos[i3], y = pos[i3 + 1], z = pos[i3 + 2];
+        const dsq = x * x + y * y + z * z;
+        if (dsq < coreR2) {
+          // push OUT to the surface. Near the z=0 plane the radial direction is
+          // degenerate (purely in-plane), so bias it off-plane by the cell's
+          // mountain/valley sign — that is what makes the sheet climb onto the
+          // sphere from both hemispheres instead of staying flat.
+          let bz = z;
+          const flat = 1.0 - Math.min(1.0, Math.abs(z) / (coreR * 0.35));
+          if (flat > 0.0) bz += cellSign[i] * coreR * 0.55 * flat;
+          let d = Math.sqrt(x * x + y * y + bz * bz);
+          let nx, ny, nz;
+          if (d < 1e-6) {
+            nx = 0.0; ny = 0.0; nz = cellSign[i] >= 0 ? 1.0 : -1.0;
+          } else {
+            nx = x / d; ny = y / d; nz = bz / d;
+          }
+          pos[i3] = nx * coreR;
+          pos[i3 + 1] = ny * coreR;
+          pos[i3 + 2] = nz * coreR;
+        }
+      }
+    }
+
+    const scEvery = forceN > 0.4 ? 2 : 3;
+    if (step % scEvery === 0 && step > 3) {
+      solveSelfCollision();
+      spawnContactCreases();
+    }
+
+    // final rigid-edge passes so the platen clamp and self-collision can never
+    // leave the surface stretched or shrunk (rest-length conservation)
+    const finalPasses = 1 + Math.round(forceN * 2);
+    for (let it = 0; it < finalPasses; it++) {
+      for (let c = 0; c < dCount; c++) {
+        const a = dAi[c] * 3, b = dBi[c] * 3;
+        let vx = pos[b] - pos[a];
+        let vy = pos[b + 1] - pos[a + 1];
+        let vz = pos[b + 2] - pos[a + 2];
+        const d = Math.hypot(vx, vy, vz);
+        if (d < 0.000001) continue;
+        const diff = (d - dRestF[c]) / d * 0.5 * dKF[c];
+        vx *= diff; vy *= diff; vz *= diff;
+        pos[a] += vx; pos[a + 1] += vy; pos[a + 2] += vz;
+        pos[b] -= vx; pos[b + 1] -= vy; pos[b + 2] -= vz;
+      }
+    }
+  }
+
+  const crumpledPositions = new Float32Array(pos);
+
+  // recenter
+  let ax = 0, ay = 0, az = 0;
+  for (let i = 0; i < N; i++) {
+    ax += crumpledPositions[i * 3];
+    ay += crumpledPositions[i * 3 + 1];
+    az += crumpledPositions[i * 3 + 2];
+  }
+  ax /= N; ay /= N; az /= N;
+  for (let i = 0; i < N; i++) {
+    crumpledPositions[i * 3] -= ax;
+    crumpledPositions[i * 3 + 1] -= ay;
+    crumpledPositions[i * 3 + 2] -= az;
+  }
+
+  const indices = [];
+  for (let iy = 0; iy < rows; iy++) {
+    for (let ix = 0; ix < cols; ix++) {
+      const v00 = iy * NX + ix;
+      const v10 = v00 + 1;
+      const v01 = (iy + 1) * NX + ix;
+      const v11 = v01 + 1;
+      indices.push(v00, v01, v10);
+      indices.push(v10, v01, v11);
+    }
+  }
+
+  const tempGeo = new THREE.BufferGeometry();
+  tempGeo.setAttribute('position', new THREE.BufferAttribute(crumpledPositions.slice(), 3));
+  tempGeo.setIndex(indices);
+  tempGeo.computeVertexNormals();
+  const crumpledNormals = tempGeo.getAttribute('normal').array;
+  tempGeo.dispose();
+
+  return { restPositions, crumpledPositions, crumpledNormals, uvs, indices };
+}
+
+// -------------------------------------------------------------------------
+// LARGE FOLD PATTERN (rigid origami, no micro-creases)
+//  - 3..4 straight diagonal crease lines across the whole sheet
+//  - 5..8 perfectly PLANAR panels (each is a rigid transform of the flat sheet)
+//  - large fold angles (90..140 deg) so panels physically overlap in 3D
+//  - nested half-spaces => every fold rotates a set with a single uniform
+//    transform, so panels never tear and never stretch
+// -------------------------------------------------------------------------
+function generateLargeFoldCrumpleData(w, h, densityRaw, seed, strengthRaw = 1.0, platenZ = 0.155) {
+  const rng = makeSeededRng(seed * 1.371 + 11.7);
+  const densityNorm = Math.min(1.0, Math.max(0.0, (densityRaw - 1.0) / 49.0));
+  const forceN = Math.min(1.0, Math.max(0.0, strengthRaw / 1.6));
+  const minDim = Math.min(w, h);
+  const DEG = Math.PI / 180.0;
+
+  const cols = 96;
+  const rows = Math.max(64, Math.round(cols * (h / w)));
+  const NX = cols + 1;
+  const NY = rows + 1;
+  const N = NX * NY;
+
+  const restPositions = new Float32Array(N * 3);
+  const uvs = new Float32Array(N * 2);
+  const crumpledPositions = new Float32Array(N * 3);
+
+  // --- CROSS-FOLD ORIGAMI NODE ---------------------------------------------
+  // 4 straight crease rays meeting at ONE point => 4 wedge panels that face in
+  // different directions. Rigid folding around a degree-4 vertex: the product
+  // of the four fold rotations must be identity (loop closure), otherwise the
+  // panels tear apart. We solve for that closure numerically, so every panel
+  // stays perfectly planar and the sheet never stretches.
+  const TWO_PI = Math.PI * 2.0;
+
+  function solve3(A, b) {
+    const M = [
+      [A[0][0], A[0][1], A[0][2], b[0]],
+      [A[1][0], A[1][1], A[1][2], b[1]],
+      [A[2][0], A[2][1], A[2][2], b[2]],
+    ];
+    for (let c = 0; c < 3; c++) {
+      let piv = c;
+      for (let r = c + 1; r < 3; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+      if (Math.abs(M[piv][c]) < 1e-12) return null;
+      const t = M[c]; M[c] = M[piv]; M[piv] = t;
+      for (let r = 0; r < 3; r++) {
+        if (r === c) continue;
+        const f = M[r][c] / M[c][c];
+        for (let k = c; k < 4; k++) M[r][k] -= f * M[c][k];
+      }
+    }
+    return [M[0][3] / M[0][0], M[1][3] / M[1][1], M[2][3] / M[2][2]];
+  }
+
+  // node position — near the centre, offset so the layout reads asymmetric
+  const nodeX = (rng() - 0.5) * w * 0.26;
+  const nodeY = (rng() - 0.5) * h * 0.26;
+  const nodeC = new THREE.Vector3(nodeX, nodeY, 0);
+
+  // 4 sectors of clearly unequal size => wedges of different width
+  // Kawasaki-flat-foldable degree-4 vertex: opposite sector angles sum to PI.
+  // This guarantees a NON-TRIVIAL rigid folding branch exists with LARGE fold
+  // angles (90-140 deg) — without it the closure solver collapses to a flat
+  // sheet with one lifted corner.
+  const a1 = 0.62 + rng() * 0.85;
+  const a2 = 0.62 + rng() * 0.85;
+  const sect = [a1, a2, Math.PI - a1, Math.PI - a2];
+  const ang = [];
+  let accA = rng() * TWO_PI;
+  for (let i = 0; i < 4; i++) { ang.push(accA); accA += sect[i]; }
+  const axes = ang.map((a) => new THREE.Vector3(Math.cos(a), Math.sin(a), 0));
+
+  // Alternating mountain / valley: adjacent panels swing to OPPOSITE sides,
+  // so the node is pushed out along Z and the sheet gains real volume.
+  const driveDeg = 46 + rng() * 20;
+  const drive = driveDeg * DEG * forceN * (rng() < 0.5 ? 1 : -1);
+  const rho = [drive, -drive * 0.92, drive * 1.05, -drive * 0.88];
+
+  const qTmp = new THREE.Quaternion();
+  function prodQ(r) {
+    const q = new THREE.Quaternion();
+    const order = [1, 2, 3, 0];
+    for (let n = 0; n < 4; n++) {
+      const i = order[n];
+      qTmp.setFromAxisAngle(axes[i], r[i]);
+      q.multiply(qTmp);
+    }
+    return q;
+  }
+  function logQ(q) {
+    let x = q.x, y = q.y, z = q.z, ww = q.w;
+    if (ww < 0) { x = -x; y = -y; z = -z; ww = -ww; }
+    const s = Math.sqrt(Math.max(0.0, 1.0 - ww * ww));
+    if (s < 1e-9) return [0, 0, 0];
+    const a = 2.0 * Math.acos(Math.min(1.0, ww));
+    return [x / s * a, y / s * a, z / s * a];
+  }
+
+  // Levenberg-Marquardt on rho1..rho3 so the four folds close the vertex loop
+  for (let it = 0; it < 70; it++) {
+    const f = logQ(prodQ(rho));
+    const err = Math.hypot(f[0], f[1], f[2]);
+    if (err < 1e-5) break;
+    const eps = 1e-4;
+    const J = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (let k = 0; k < 3; k++) {
+      const t = rho.slice();
+      t[k + 1] += eps;
+      const fk = logQ(prodQ(t));
+      for (let r = 0; r < 3; r++) J[r][k] = (fk[r] - f[r]) / eps;
+    }
+    const lam = 1e-3 + err * 0.03;
+    const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    const b = [0, 0, 0];
+    for (let i2 = 0; i2 < 3; i2++) {
+      for (let j2 = 0; j2 < 3; j2++) {
+        let s2 = 0;
+        for (let r = 0; r < 3; r++) s2 += J[r][i2] * J[r][j2];
+        A[i2][j2] = s2 + (i2 === j2 ? lam : 0);
+      }
+      let s3 = 0;
+      for (let r = 0; r < 3; r++) s3 += J[r][i2] * f[r];
+      b[i2] = -s3;
+    }
+    const d = solve3(A, b);
+    if (!d) break;
+    for (let k = 0; k < 3; k++) rho[k + 1] += Math.max(-0.35, Math.min(0.35, d[k]));
+  }
+
+  // accumulated rigid transform per wedge
+  const T = [new THREE.Quaternion()];
+  const accQ = new THREE.Quaternion();
+  for (let k = 1; k < 4; k++) {
+    qTmp.setFromAxisAngle(axes[k], rho[k]);
+    accQ.multiply(qTmp);
+    T.push(accQ.clone());
+  }
+  // spread whatever closure error is left evenly across the four creases
+  const resLog = logQ(prodQ(rho));
+  const rl = new THREE.Vector3(resLog[0], resLog[1], resLog[2]);
+  const rang = rl.length();
+  if (rang > 1e-8) {
+    const rax = rl.divideScalar(rang);
+    for (let k = 1; k < 4; k++) {
+      T[k].multiply(new THREE.Quaternion().setFromAxisAngle(rax, -rang * k * 0.25));
+    }
+  }
+
+  // NO TUMBLE: re-frame every wedge transform relative to the LARGEST panel so
+  // that panel stays exactly in the flat XY plane, facing the camera. The sheet
+  // therefore always reads as folding out of a flat sheet — it never spins or
+  // drifts in orientation with the seed.
+  let baseWedge = 0;
+  for (let k = 1; k < 4; k++) if (sect[k] > sect[baseWedge]) baseWedge = k;
+  const baseInv = T[baseWedge].clone().invert();
+  for (let k = 0; k < 4; k++) T[k].premultiply(baseInv);
+
+  function wedgeOf(px, py) {
+    const th = Math.atan2(py - nodeY, px - nodeX);
+    for (let k = 0; k < 4; k++) {
+      let d0 = th - ang[k];
+      d0 = ((d0 % TWO_PI) + TWO_PI) % TWO_PI;
+      const wsp = (k < 3) ? (ang[k + 1] - ang[k]) : (ang[0] + TWO_PI - ang[3]);
+      if (d0 < wsp) return k;
+    }
+    return 0;
+  }
+
+  // --- 1..2 large corner flaps, each fully inside a single wedge ------------
+  const cornersXY = [
+    [-w * 0.5, -h * 0.5], [w * 0.5, -h * 0.5],
+    [w * 0.5, h * 0.5], [-w * 0.5, h * 0.5],
+  ];
+  const cornerFolds = [];
+  const pickOrder = [0, 1, 2, 3].sort(() => rng() - 0.5);
+  const wantFlaps = 4;
+  for (const ci of pickOrder) {
+    if (cornerFolds.length >= wantFlaps) break;
+    const ccx = cornersXY[ci][0], ccy = cornersXY[ci][1];
+    const ul = Math.hypot(ccx - nodeX, ccy - nodeY) || 1;
+    const ux = (nodeX - ccx) / ul, uy = (nodeY - ccy) / ul;
+    // panel scale 0.866 linear => ~25% less area per flat panel
+    const dcut = minDim * (0.22 + rng() * 0.22) * 0.79;
+    const pxp = -uy, pyp = ux;
+    const wc = wedgeOf(ccx, ccy);
+    let ok = true;
+    for (let s = 0; s <= 4; s++) {
+      const tt = (s / 4) * dcut;
+      if (wedgeOf(ccx + ux * tt + pxp * tt, ccy + uy * tt + pyp * tt) !== wc) ok = false;
+      if (wedgeOf(ccx + ux * tt - pxp * tt, ccy + uy * tt - pyp * tt) !== wc) ok = false;
+    }
+    if (!ok) continue;
+    // SECONDARY SMALLER FACETS: in SOME flaps only (seed decides), the flap is
+    // subdivided by 1-2 extra creases parallel to its hinge. They are nested
+    // triangles fully inside the flap, so every sub-panel stays perfectly
+    // planar and no edge tears. Applied innermost-first.
+    const subs = [];
+    if (rng() < 1.0) {
+      const nSub = 2 + (rng() < 0.6 ? 1 : 0) + (rng() < 0.35 ? 1 : 0);
+      let dPrev = dcut;
+      for (let s = 0; s < nSub; s++) {
+        const dSub = dPrev * (0.52 + rng() * 0.20);
+        subs.push({
+          d: dSub,
+          point: new THREE.Vector3(ccx + ux * dSub, ccy + uy * dSub, 0),
+          quat: new THREE.Quaternion().setFromAxisAngle(
+            new THREE.Vector3(-uy, ux, 0).normalize(),
+            (34 + rng() * 28) * DEG * forceN * (rng() < 0.5 ? 1 : -1)
+          ),
+        });
+        dPrev = dSub;
+      }
+      // innermost first
+      subs.sort((a, b) => a.d - b.d);
+    }
+
+    cornerFolds.push({
+      cx: ccx, cy: ccy, ux, uy, dcut, wedge: wc, subs,
+      point: new THREE.Vector3(ccx + ux * dcut, ccy + uy * dcut, 0),
+      quat: new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(-uy, ux, 0).normalize(),
+        (48 + rng() * 22) * DEG * forceN * (rng() < 0.5 ? 1 : -1)
+      ),
+    });
+  }
+
+  const v = new THREE.Vector3();
+  for (let iy = 0; iy < NY; iy++) {
+    const vN = iy / rows;
+    for (let ix = 0; ix < NX; ix++) {
+      const uN = ix / cols;
+      const i = iy * NX + ix;
+      const px = -w * 0.5 + uN * w;
+      const py = h * 0.5 - vN * h;
+
+      restPositions[i * 3] = px;
+      restPositions[i * 3 + 1] = py;
+      restPositions[i * 3 + 2] = 0.0;
+      uvs[i * 2] = Math.max(0.0005, Math.min(0.9995, uN));
+      uvs[i * 2 + 1] = Math.max(0.0005, Math.min(0.9995, 1.0 - vN));
+
+      const wk = wedgeOf(px, py);
+      v.set(px, py, 0);
+
+      // corner flap folds first, in the flat frame (keeps the panel rigid)
+      for (const cf of cornerFolds) {
+        if (cf.wedge !== wk) continue;
+        const rel = (px - cf.cx) * cf.ux + (py - cf.cy) * cf.uy;
+        if (rel >= 0 && rel < cf.dcut) {
+          for (let s = 0; s < cf.subs.length; s++) {
+            const sf = cf.subs[s];
+            if (rel < sf.d) v.sub(sf.point).applyQuaternion(sf.quat).add(sf.point);
+          }
+          v.sub(cf.point).applyQuaternion(cf.quat).add(cf.point);
+          break;
+        }
+      }
+
+      // wedge rotation about the shared node => real Z depth, panels overlap
+      v.sub(nodeC).applyQuaternion(T[wk]).add(nodeC);
+
+      crumpledPositions[i * 3] = v.x;
+      crumpledPositions[i * 3 + 1] = v.y;
+      // hairline separation so stacked panels never z-fight
+      crumpledPositions[i * 3 + 2] = v.z + wk * minDim * 0.0035;
+    }
+  }
+
+  let ax = 0, ay = 0, az = 0;
+  for (let i = 0; i < N; i++) {
+    ax += crumpledPositions[i * 3];
+    ay += crumpledPositions[i * 3 + 1];
+    az += crumpledPositions[i * 3 + 2];
+  }
+  ax /= N; ay /= N; az /= N;
+  // PLATEN FLATTENING: an invisible flat surface presses the folded form down.
+  // A uniform scale along Z is affine, so every panel stays perfectly planar and
+  // every crease stays sharp — the silhouette just reads pressed, not airborne.
+  const PLATEN_Z = 0.155;
+  for (let i = 0; i < N; i++) {
+    crumpledPositions[i * 3] -= ax;
+    crumpledPositions[i * 3 + 1] -= ay;
+    crumpledPositions[i * 3 + 2] = (crumpledPositions[i * 3 + 2] - az) * PLATEN_Z;
+  }
+
+  const indices = [];
+  for (let iy = 0; iy < rows; iy++) {
+    for (let ix = 0; ix < cols; ix++) {
+      const v00 = iy * NX + ix;
+      const v10 = v00 + 1;
+      const v01 = (iy + 1) * NX + ix;
+      const v11 = v01 + 1;
+      indices.push(v00, v01, v10);
+      indices.push(v10, v01, v11);
+    }
+  }
+
+  const tempGeo = new THREE.BufferGeometry();
+  tempGeo.setAttribute('position', new THREE.BufferAttribute(crumpledPositions.slice(), 3));
+  tempGeo.setIndex(indices);
+  tempGeo.computeVertexNormals();
+  const crumpledNormals = tempGeo.getAttribute('normal').array;
+  tempGeo.dispose();
+
+  return { restPositions, crumpledPositions, crumpledNormals, uvs, indices };
+}
+
+// Small LRU cache so a seed morph only simulates the NEW seed, not both.
+const crumpleDataCache = new Map();
+function getCrumpleData(w, h, density, seed, strength = 1.0) {
+  const sQ = Math.round(strength * 10) / 10;
+  const key = `${w.toFixed(3)}_${h.toFixed(3)}_${density.toFixed(2)}_${seed}_${sQ}`;
+  const hit = crumpleDataCache.get(key);
+  if (hit) return hit;
+  const data = generateLargeFoldCrumpleData(w, h, density, seed, sQ);
+  crumpleDataCache.set(key, data);
+  if (crumpleDataCache.size > 4) {
+    crumpleDataCache.delete(crumpleDataCache.keys().next().value);
+  }
+  return data;
+}
+
+// -------------------------------------------------------------------------
+// 5-PHASE PROGRESSIVE CRUMPLE
+// Phase 0 = flat sheet, phases 1..5 = the SAME crease layout folded to
+// progressively deeper angles. The sheet therefore passes through real
+// intermediate stages instead of snapping between "flat" and "crumpled".
+// -------------------------------------------------------------------------
+const CRUMPLE_PHASES = 5;
+const phaseCache = new Map();
+
+function getCrumplePhases(w, h, density, seed, strength) {
+  const sQ = Math.round(strength * 10) / 10;
+  const key = `${w.toFixed(3)}_${h.toFixed(3)}_${density.toFixed(2)}_${seed}_${sQ}`;
+  const hit = phaseCache.get(key);
+  if (hit) return hit;
+
+  // Per-phase fold force and platen compression. The ramp is deliberately
+  // non-linear: phases 1-4 build up, phase 5 is a hard slam — maximum fold
+  // angles AND a much flatter platen, so the final pose reads unmistakably as
+  // "pressed against a wall by an invisible bar".
+  const PHASE_FORCE = [0.30, 0.52, 0.74, 1.00, 1.85];
+  const PHASE_PLATEN = [0.170, 0.160, 0.145, 0.120, 0.045];
+
+  const stages = [];
+  let flatNormals = null;
+  for (let p = 1; p <= CRUMPLE_PHASES; p++) {
+    const f = PHASE_FORCE[p - 1];
+    const d = generateLargeFoldCrumpleData(w, h, density, seed, sQ * f, PHASE_PLATEN[p - 1]);
+    if (!flatNormals) {
+      flatNormals = new Float32Array(d.restPositions.length);
+      for (let i = 2; i < flatNormals.length; i += 3) flatNormals[i] = 1.0;
+      stages.push({ pos: d.restPositions, norm: flatNormals });
+    }
+    stages.push({ pos: d.crumpledPositions, norm: d.crumpledNormals });
+  }
+  phaseCache.set(key, stages);
+  if (phaseCache.size > 3) phaseCache.delete(phaseCache.keys().next().value);
+  return stages;
+}
+
+function blendPhase(stages, prog, out, outN, weight, additive) {
+  const t = Math.max(0, Math.min(1, prog)) * CRUMPLE_PHASES;
+  let i = Math.floor(t);
+  let f = t - i;
+  if (i >= CRUMPLE_PHASES) { i = CRUMPLE_PHASES - 1; f = 1.0; }
+  f = f * f * (3.0 - 2.0 * f);
+  const a = stages[i], b = stages[i + 1];
+  const n = out.length;
+  for (let k = 0; k < n; k++) {
+    const pv = a.pos[k] + (b.pos[k] - a.pos[k]) * f;
+    const nv = a.norm[k] + (b.norm[k] - a.norm[k]) * f;
+    if (additive) { out[k] += pv * weight; outN[k] += nv * weight; }
+    else { out[k] = pv * weight; outN[k] = nv * weight; }
+  }
+}
+
+let phaseBufPos = null;
+let phaseBufNorm = null;
+
+// Stepped phase remap: each of the 5 phases gets a SHORT transition followed by
+// a long visible plateau, so the eye reads five distinct stages of crumpling.
+function phaseStep(p) {
+  const u = Math.max(0, Math.min(1, p)) * CRUMPLE_PHASES;
+  let i = Math.floor(u);
+  let f = u - i;
+  if (i >= CRUMPLE_PHASES) { i = CRUMPLE_PHASES - 1; f = 1.0; }
+  const TRANS = 0.42; // 30% moving, 70% holding
+  let g = Math.min(1.0, f / TRANS);
+  g = g * g * (3.0 - 2.0 * g);
+  return (i + g) / CRUMPLE_PHASES;
+}
+
+function applyCrumplePhase(progRaw, morph) {
+  if (!crumpleMesh || !crumpleMesh.geometry) return;
+  const prog = phaseStep(progRaw);
+  const density = controls.get('wrinkleDensity') ?? 50.0;
+  const str = controls.get('crumpleFoldStrength') ?? 1.0;
+  const stagesA = getCrumplePhases(posterWidth, posterHeight, density, currentSeedA, str);
+  const stagesB = (currentSeedA === currentSeedB)
+    ? stagesA
+    : getCrumplePhases(posterWidth, posterHeight, density, currentSeedB, str);
+
+  const len = stagesA[0].pos.length;
+  if (!phaseBufPos || phaseBufPos.length !== len) {
+    phaseBufPos = new Float32Array(len);
+    phaseBufNorm = new Float32Array(len);
+  }
+  const m = Math.max(0, Math.min(1, morph || 0));
+  blendPhase(stagesA, prog, phaseBufPos, phaseBufNorm, 1.0 - m, false);
+  if (m > 0.0001) blendPhase(stagesB, prog, phaseBufPos, phaseBufNorm, m, true);
+
+  const geo = crumpleMesh.geometry;
+  const ap = geo.getAttribute('aCrumpledPos');
+  const an = geo.getAttribute('aCrumpledNormal');
+  const ap2 = geo.getAttribute('aCrumpledPosNext');
+  const an2 = geo.getAttribute('aCrumpledNormalNext');
+  if (!ap || ap.array.length !== len) return;
+  ap.copyArray(phaseBufPos); an.copyArray(phaseBufNorm);
+  ap2.copyArray(phaseBufPos); an2.copyArray(phaseBufNorm);
+  ap.needsUpdate = true; an.needsUpdate = true;
+  ap2.needsUpdate = true; an2.needsUpdate = true;
+}
+
+let currentSeedA = controls.get('crumpleSeed') ?? 74;
+let currentSeedB = currentSeedA;
+
+function createCrumpleGeometry(w, h, density, seedA, seedB) {
+  const str = controls.get('crumpleFoldStrength') ?? 1.0;
+  const dataA = getCrumpleData(w, h, density, seedA, str);
+  const dataB = (seedA === seedB) ? dataA : getCrumpleData(w, h, density, seedB, str);
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(dataA.restPositions, 3));
+  
+  const attrPosA = new THREE.BufferAttribute(new Float32Array(dataA.crumpledPositions), 3);
+  attrPosA.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute('aCrumpledPos', attrPosA);
+
+  const attrNormA = new THREE.BufferAttribute(new Float32Array(dataA.crumpledNormals), 3);
+  attrNormA.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute('aCrumpledNormal', attrNormA);
+
+  const attrPosB = new THREE.BufferAttribute(new Float32Array(dataB.crumpledPositions), 3);
+  attrPosB.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute('aCrumpledPosNext', attrPosB);
+
+  const attrNormB = new THREE.BufferAttribute(new Float32Array(dataB.crumpledNormals), 3);
+  attrNormB.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute('aCrumpledNormalNext', attrNormB);
+
+  geometry.setAttribute('uv', new THREE.BufferAttribute(dataA.uvs, 2));
+  geometry.setIndex(dataA.indices);
+  geometry.computeVertexNormals();
+
+  return geometry;
+}
+
+function updateCrumpleBuffers(seedA, seedB) {
+  if (!crumpleMesh || !crumpleMesh.geometry) return;
+  const density = controls.get('wrinkleDensity') ?? 50.0;
+  
+  const str = controls.get('crumpleFoldStrength') ?? 1.0;
+  const dataA = getCrumpleData(posterWidth, posterHeight, density, seedA, str);
+  const dataB = (seedA === seedB) ? dataA : getCrumpleData(posterWidth, posterHeight, density, seedB, str);
+
+  const geo = crumpleMesh.geometry;
+  const attrPosA = geo.getAttribute('aCrumpledPos');
+  const attrNormA = geo.getAttribute('aCrumpledNormal');
+  const attrPosB = geo.getAttribute('aCrumpledPosNext');
+  const attrNormB = geo.getAttribute('aCrumpledNormalNext');
+
+  if (attrPosA && attrPosB) {
+    attrPosA.copyArray(dataA.crumpledPositions);
+    attrNormA.copyArray(dataA.crumpledNormals);
+    attrPosB.copyArray(dataB.crumpledPositions);
+    attrNormB.copyArray(dataB.crumpledNormals);
+
+    attrPosA.needsUpdate = true;
+    attrNormA.needsUpdate = true;
+    attrPosB.needsUpdate = true;
+    attrNormB.needsUpdate = true;
+  }
+}
+
+// =========================================================================
 // 10. FLOATING TILES SHADER
 // =========================================================================
 const tileVertexShader = `
@@ -2238,9 +3683,11 @@ const SEG_Y = 128;
 
 let foldMesh = null;
 let peelLayerMeshes = [];
+let crumpleMesh = null;
 
 let foldMaterial = null;
 let peelLayerMaterials = [];
+let crumpleMaterial = null;
 
 const floatTilesGroup = new THREE.Group();
 mainStage.add(floatTilesGroup);
@@ -2290,6 +3737,7 @@ function updateMaterialStockAndTextures() {
 
   applyToUniforms(foldUniforms);
   applyToUniforms(peelUniforms);
+  applyToUniforms(crumpleUniforms);
 
   peelLayerMaterials.forEach((m) => {
     applyToUniforms(m.uniforms);
@@ -2341,6 +3789,12 @@ function createMaterials() {
     peelLayerMaterials.push(mat);
   }
 
+  crumpleMaterial = new THREE.ShaderMaterial({
+    vertexShader: crumpleVertexShader,
+    fragmentShader: crumpleFragmentShader,
+    uniforms: crumpleUniforms,
+    side: THREE.DoubleSide,
+  });
 
   updateMaterialStockAndTextures();
 }
@@ -2680,12 +4134,14 @@ function updateActiveModeVisibility() {
   });
 
   if (floatTilesGroup) floatTilesGroup.visible = mode === 'float';
+  if (crumpleMesh) crumpleMesh.visible = mode === 'crumple';
 }
 
 function rebuildGeometries() {
   const geo = new THREE.PlaneGeometry(posterWidth, posterHeight, SEG_X, SEG_Y);
 
   foldUniforms.uDimensions.value.set(posterWidth, posterHeight);
+  crumpleUniforms.uDimensions.value.set(posterWidth, posterHeight);
 
   peelLayerMaterials.forEach((m) => {
     m.uniforms.uDimensions.value.set(posterWidth, posterHeight);
@@ -2701,6 +4157,10 @@ function rebuildGeometries() {
   });
   peelLayerMeshes = [];
 
+  if (crumpleMesh) {
+    mainStage.remove(crumpleMesh);
+    if (crumpleMesh.geometry) crumpleMesh.geometry.dispose();
+  }
 
   foldMesh = new THREE.Mesh(geo, foldMaterial);
   mainStage.add(foldMesh);
@@ -2713,6 +4173,14 @@ function rebuildGeometries() {
     peelLayerMeshes.push(mesh);
   }
 
+  const density = controls.get('wrinkleDensity') ?? 50.0;
+  const baseSeed = controls.get('crumpleSeed') ?? 74;
+  currentSeedA = baseSeed;
+  currentSeedB = baseSeed;
+  const crumpleGeo = createCrumpleGeometry(posterWidth, posterHeight, density, currentSeedA, currentSeedB);
+  
+  crumpleMesh = new THREE.Mesh(crumpleGeo, crumpleMaterial);
+  mainStage.add(crumpleMesh);
 
   rebuildFloatingTiles();
   updateActiveModeVisibility();
@@ -2725,6 +4193,7 @@ function syncTexturesToShaders() {
   const textures = getActiveTexturesList();
   
   foldUniforms.uTexture.value = textures[0];
+  crumpleUniforms.uTexture.value = textures[0];
 
   for (let i = 0; i < peelLayerMaterials.length; i++) {
     const texIdx = i % textures.length;
@@ -2965,6 +4434,11 @@ controls.onChange('foldBacksideImage', (val) => {
 
 controls.onChange('mode', (val) => {
   updateActiveModeVisibility();
+  if (val === 'crumple') {
+    autoCrumpleTime = 0.0;
+    lastAutoCrumpleCycleIdx = -1;
+    crumpleUniforms.uSeedMorph.value = 0.0;
+  }
 });
 
 controls.onChange('numLayers', () => {
@@ -2989,6 +4463,7 @@ controls.onChange('paperTexture', () => {
 controls.onChange('glossVarnishDensity', (val) => {
   foldUniforms.uGlossDensity.value = val;
   peelLayerMaterials.forEach(m => m.uniforms.uGlossDensity.value = val);
+  crumpleUniforms.uGlossDensity.value = val;
   floatingTiles.forEach(tile => {
     if (tile.material && tile.material.uniforms) tile.material.uniforms.uGlossDensity.value = val;
   });
@@ -2997,6 +4472,7 @@ controls.onChange('glossVarnishDensity', (val) => {
 controls.onChange('glossShineStrength', (val) => {
   foldUniforms.uGlossShine.value = val;
   peelLayerMaterials.forEach(m => m.uniforms.uGlossShine.value = val);
+  crumpleUniforms.uGlossShine.value = val;
   floatingTiles.forEach(tile => {
     if (tile.material && tile.material.uniforms) tile.material.uniforms.uGlossShine.value = val;
   });
@@ -3005,6 +4481,7 @@ controls.onChange('glossShineStrength', (val) => {
 controls.onChange('crumpleTextureFolds', (val) => {
   foldUniforms.uCrumpleFolds.value = val;
   peelLayerMaterials.forEach(m => m.uniforms.uCrumpleFolds.value = val);
+  crumpleUniforms.uCrumpleFolds.value = val;
   for (const k in tileMapsCache) delete tileMapsCache[k];
   updateMaterialStockAndTextures();
 });
@@ -3026,12 +4503,73 @@ controls.onChange('paperRoughness', () => {
   updateMaterialStockAndTextures();
 });
 
+let crumpleRebuildTimer = null;
+function scheduleCrumpleRebuild(seedA, seedB) {
+  if (crumpleRebuildTimer) clearTimeout(crumpleRebuildTimer);
+  crumpleRebuildTimer = setTimeout(() => {
+    crumpleRebuildTimer = null;
+    updateCrumpleBuffers(seedA, seedB);
+  }, 90);
+}
+
+controls.onChange('wrinkleDensity', () => {
+  scheduleCrumpleRebuild(currentSeedA, currentSeedB);
+});
+
+controls.onChange('crumpleSeed', (val) => {
+  currentSeedA = val;
+  currentSeedB = val;
+  crumpleUniforms.uSeedMorph.value = 0.0;
+  scheduleCrumpleRebuild(val, val);
+});
+
+controls.onChange('autoCrumple', (val) => {
+  if (!val) {
+    currentSeedA = controls.get('crumpleSeed') ?? 74;
+    currentSeedB = currentSeedA;
+    crumpleUniforms.uSeedMorph.value = 0.0;
+    updateCrumpleBuffers(currentSeedA, currentSeedB);
+  } else {
+    autoCrumpleTime = 0.0;
+    lastAutoCrumpleCycleIdx = -1;
+  }
+});
+
+controls.onChange('randomizeCrumpleSeed', (val) => {
+  if (!val) {
+    currentSeedA = controls.get('crumpleSeed') ?? 74;
+    currentSeedB = currentSeedA;
+    crumpleUniforms.uSeedMorph.value = 0.0;
+    updateCrumpleBuffers(currentSeedA, currentSeedB);
+  }
+});
+
+controls.onChange('crumpleAnimType', () => {
+  autoCrumpleTime = 0.0;
+  lastAutoCrumpleCycleIdx = -1;
+  crumpleUniforms.uSeedMorph.value = 0.0;
+});
+
+controls.onChange('crumpleFoldStrength', (val) => {
+  crumpleUniforms.uCrumpleFoldStrength.value = val;
+  // press force is part of the simulation now — re-solve the sheet
+  scheduleCrumpleRebuild(currentSeedA, currentSeedB);
+});
+
+controls.onChange('crumpleMicroTextureIntensity', (val) => {
+  crumpleUniforms.uCrumpleMicroTextureIntensity.value = val;
+});
+
+controls.onChange('crumpleMicroTextureSize', (val) => {
+  crumpleUniforms.uCrumpleMicroTextureSize.value = val;
+});
 
 controls.onChange('grainIntensity', (val) => {
   foldUniforms.uGrainIntensity.value = val;
   peelLayerMaterials.forEach((m) => {
     m.uniforms.uGrainIntensity.value = val;
   });
+  crumpleUniforms.uGrainIntensity.value = val;
   floatingTiles.forEach((tile) => {
     if (tile.material && tile.material.uniforms) {
       tile.material.uniforms.uGrainIntensity.value = val;
@@ -4141,6 +5679,7 @@ controls.onChange('backsideColor', (val) => {
     showcaseStepTilt: 14,        // нахил кожного місця в ланцюжку, °
     showcaseStepStagger: 0.025,  // затримка між картками на кроці, с
     showcaseStepDirection: 1,    // 1 = вгору-ліворуч, -1 = вниз-праворуч
+    showcaseStepGap: 0.45,       // відстань між картками в глибину (щоб не провалювались одна в одну)
     showcaseCount: 12,
     showcaseSpeed: 0.35,
     showcaseCardSize: 1.5,
@@ -4411,8 +5950,12 @@ controls.onChange('backsideColor', (val) => {
     let tW = tH * scTitleAspect;
     const maxW = halfW * 1.9;
     const tScale = tW > maxW ? maxW / tW : 1;
-    scTitle.scale.set(tW * tScale, tH * tScale, 1);
-    scTitle.position.set(0, 0, 0);
+    // in 'steps' the title sits behind the whole chain (same on-screen size)
+    const nC = Math.max(1, scCards.length);
+    const tZ = motion === 'steps' ? -(nC / 2 * Math.max(0.02, scNum('showcaseStepGap')) * depth + 0.6) : 0;
+    const tP = Math.max(0.2, (dist - tZ) / dist);
+    scTitle.scale.set(tW * tScale * tP, tH * tScale * tP, 1);
+    scTitle.position.set(0, 0, tZ);
     scTitleMat.uniforms.uColor.value.set(scGet('showcaseTitleColor') || '#111111');
 
     // parallax: the whole cloud leans towards the pointer
@@ -4456,8 +5999,10 @@ controls.onChange('backsideColor', (val) => {
         const spacing = halfW * 0.55 * scNum('showcaseStepSpacing') * spread;
         x = Math.cos(ang) * sPos * spacing;
         y = -Math.sin(ang) * sPos * spacing;
-        // later cards (towards bottom-right) lie on top of earlier ones
-        z = 0.35 + (sPos + half) * 0.025 * depth;
+        // later cards (towards bottom-right) lie on top of earlier ones, with a
+        // real gap in depth so tilted cards never cut into each other; the
+        // perspective this would add is cancelled below (see persp)
+        z = sPos * Math.max(0.02, scNum('showcaseStepGap')) * depth;
         // fade only at the far ends of the loop, where the wrap happens
         const edge = half - Math.abs(sPos);
         op = Math.min(1, Math.max(0, edge / 0.6));
@@ -4501,15 +6046,18 @@ controls.onChange('backsideColor', (val) => {
         const f = fl * fl * (3 - 2 * fl);   // smooth hand-over between the angles of two places
         const tiltDeg = scNum('showcaseStepTilt');
         const tiltZ = THREE.MathUtils.degToRad(tiltDeg) * 2 * scLerp(scSlotTilt(k0, seed), scSlotTilt(k0 + 1, seed), f);
-        const yaw = 0.35 * rotAmt * 2 * scLerp(scSlotYaw(k0, seed), scSlotYaw(k0 + 1, seed), f);
+        const yaw = 0.2 * rotAmt * 2 * scLerp(scSlotYaw(k0, seed), scSlotYaw(k0 + 1, seed), f);
         scEuler.set(0.06 * rotAmt * Math.sin(wobT * 0.3), yaw, tiltZ + (cd.r5 - 0.5) * 0.12 * rotAmt);
       } else {
         scEuler.set(tx, ty + (motion === 'orbit' ? -Math.atan2(z, x) + Math.PI / 2 : 0), tz);
       }
 
-      cd.mesh.position.set(x, y, z);
+      // steps: keep the on-screen size & layout independent of depth, so the
+      // depth gap doesn't read as perspective (near cards bigger, far smaller)
+      const persp = motion === 'steps' ? Math.max(0.2, (dist - z) / dist) : 1;
+      cd.mesh.position.set(x * persp, y * persp, z);
       cd.mesh.rotation.copy(scEuler);
-      cd.mesh.scale.set(wid, hgt, 1);
+      cd.mesh.scale.set(wid * persp, hgt * persp, 1);
       cd.mesh.material.uniforms.uOpacity.value = op;
       cd.mesh.visible = op > 0.01;
     }
@@ -4869,7 +6417,120 @@ function animate() {
     }
   }
 
+  // 4. Crumpled Paper Mode Animation (Silky Smooth Morphed Transitions)
+  else if (mode === 'crumple') {
+    const crumpleSpeed = controls.get('crumpleSpeed') ?? 1.35;
+    let crumpleProg = controls.get('crumpleProgress') ?? 0.0;
+    const shouldRandomizeSeed = controls.get('randomizeCrumpleSeed') !== false;
+    const animType = controls.get('crumpleAnimType') || 'cycle';
+    
+    if (isClickTrigger) {
+      crumpleProg = updateTween(crumpleTween, delta, crumpleSpeed);
+      const crumpleTease = getIdleTease(crumpleTween, elapsed, 0.038, 2.4);
+      crumpleProg = THREE.MathUtils.clamp(crumpleProg + crumpleTease, 0.0, 1.0);
+      crumpleUniforms.uSeedMorph.value = 0.0;
+    } else if (controls.get('autoCrumple')) {
+      // Stop-motion: hold each pose for one "shot", then jump to the next.
+      const stopMo = controls.get('crumpleStopMotion') === true;
+      const stopFps = Math.max(1.0, controls.get('crumpleStopMotionFps') ?? 8);
+      const stopStep = 1.0 / stopFps;
+      const quantT = (t) => (stopMo ? Math.floor(t / stopStep) * stopStep : t);
 
+      if (animType === 'stay_crumpled') {
+        crumpleProg = 1.0;
+        const morphDuration = 2.0 / Math.max(0.1, crumpleSpeed);
+        const totalCycle = morphDuration + pauseDuration;
+        
+        autoCrumpleTime += delta;
+        const animT = quantT(autoCrumpleTime);
+        const cycleIdx = Math.floor(animT / totalCycle);
+        
+        if (cycleIdx !== lastAutoCrumpleCycleIdx) {
+          if (lastAutoCrumpleCycleIdx !== -1) {
+            currentSeedA = currentSeedB;
+            currentSeedB = shouldRandomizeSeed
+              ? Math.floor(Math.random() * 10000) + 1
+              : (controls.get('crumpleSeed') ?? 74);
+            updateCrumpleBuffers(currentSeedA, currentSeedB);
+          } else {
+            currentSeedA = controls.get('crumpleSeed') ?? 74;
+            currentSeedB = shouldRandomizeSeed
+              ? Math.floor(Math.random() * 10000) + 1
+              : currentSeedA;
+            updateCrumpleBuffers(currentSeedA, currentSeedB);
+          }
+          lastAutoCrumpleCycleIdx = cycleIdx;
+        }
+
+        const cycleTime = animT % totalCycle;
+        if (cycleTime < morphDuration) {
+          crumpleUniforms.uSeedMorph.value = cycleTime / morphDuration;
+        } else {
+          crumpleUniforms.uSeedMorph.value = 1.0;
+        }
+      } else {
+        // Longer per-phase dwell: the 5 folding stages each get noticeably more
+        // screen time so the progression reads stage by stage.
+        const crumpleMotionDuration = 7.4 / Math.max(0.1, crumpleSpeed);
+        const t1 = crumpleMotionDuration;
+        const t2 = t1 + pauseDuration;
+        const t3 = t2 + crumpleMotionDuration;
+        const totalCrumpleCycle = t3 + pauseDuration;
+
+        autoCrumpleTime += delta;
+        const cycleIdx = Math.floor(autoCrumpleTime / totalCrumpleCycle);
+        
+        if (cycleIdx !== lastAutoCrumpleCycleIdx) {
+          if (lastAutoCrumpleCycleIdx !== -1 && shouldRandomizeSeed) {
+            currentSeedA = Math.floor(Math.random() * 10000) + 1;
+            currentSeedB = currentSeedA;
+            updateCrumpleBuffers(currentSeedA, currentSeedB);
+          }
+          lastAutoCrumpleCycleIdx = cycleIdx;
+        }
+
+        const animT = quantT(autoCrumpleTime);
+        const cycleTime = animT % totalCrumpleCycle;
+        crumpleUniforms.uSeedMorph.value = 0.0;
+
+        // LINEAR ramp: phaseStep() already shapes each stage, so a linear drive
+        // gives all 5 phases exactly the same plateau + transition length.
+        if (cycleTime < t1) {
+          crumpleProg = cycleTime / crumpleMotionDuration;
+        } else if (cycleTime < t2) {
+          crumpleProg = 1.0;
+        } else if (cycleTime < t3) {
+          crumpleProg = 1.0 - (cycleTime - t2) / crumpleMotionDuration;
+        } else {
+          crumpleProg = 0.0;
+        }
+      }
+    } else {
+      crumpleProg = controls.get('crumpleProgress') ?? 0.0;
+      crumpleUniforms.uSeedMorph.value = 0.0;
+    }
+
+    // Progressive 5-phase folding is baked on the CPU into the morph buffers,
+    // so the shader just displays the already-blended pose at full amount.
+    const seedMorphNow = crumpleUniforms.uSeedMorph.value;
+    applyCrumplePhase(crumpleProg, seedMorphNow);
+    crumpleUniforms.uCrumpleProgress.value = 1.0;
+    crumpleUniforms.uSeedMorph.value = 0.0;
+    crumpleUniforms.uCrumpleFoldStrength.value = 1.0;
+    crumpleUniforms.uCrumpleMicroTextureIntensity.value = controls.get('crumpleMicroTextureIntensity') ?? 1.0;
+    crumpleUniforms.uCrumpleMicroTextureSize.value = controls.get('crumpleMicroTextureSize') ?? 1.2;
+    crumpleUniforms.uGrainIntensity.value = grainInt;
+    crumpleUniforms.uRoughness.value = effRough;
+    crumpleUniforms.uStockType.value = stockCode;
+    crumpleUniforms.uGlossDensity.value = glossDens;
+    crumpleUniforms.uGlossShine.value = glossShine;
+    crumpleUniforms.uCrumpleFolds.value = crumpleFolds;
+    crumpleUniforms.uKeyLightIntensity.value = keyLightInt;
+    crumpleUniforms.uFillLightIntensity.value = fillLightInt;
+    crumpleUniforms.uKeyLightPos.value.copy(keyPosVec);
+    crumpleUniforms.uFillLightPos.value.copy(fillPosVec);
+    crumpleUniforms.uTime.value = elapsed;
+  }
 
   // Continuous Camera Orbit & Sway (Runs on Stage independently of paper mode)
   const orbitSpeed = controls.get('cameraOrbitSpeed') ?? 0.2;
@@ -4879,7 +6540,7 @@ function animate() {
   // sway are damped to roughly a third in this mode only.
   // Crumpled mode: the sheet is LOCKED front-facing. No auto-orbit, no sway,
   // no drift, no seed-driven orientation. Only the user's manual orbit moves it.
-  if (mode === 'corners' || mode === 'collage' || mode === 'showcase') {
+  if (mode === 'crumple' || mode === 'corners' || mode === 'collage' || mode === 'showcase') {
     stageOrbitAngle = 0.0;
     mainStage.rotation.set(0, 0, 0);
     mainStage.position.set(0, 0, 0);
