@@ -12,7 +12,7 @@ THREE.ColorManagement.enabled = false;
 
 // Version stamp — visible in the browser console, so it's easy to see which
 // tool.js Brik actually loaded.
-window.PAPER_TOOL_VERSION = '2026-10-02 · v11 (crumple uses your poster)';
+window.PAPER_TOOL_VERSION = '2026-10-02 · v13 (pile keeps growing)';
 console.info('%c[paper-tool] loaded ' + window.PAPER_TOOL_VERSION, 'background:#ffd23f;color:#111;padding:2px 6px;border-radius:3px');
 
 // Setup render area and Three.js scene
@@ -5252,7 +5252,9 @@ controls.onChange('backsideColor', (val) => {
     collageSweepAngle: 0,         // куди змітає рука, ° (0 = праворуч, 90 = вгору, 180 = ліворуч)
     collageSweepDuration: 0.6,    // як довго виїжджає один шматок, с
     collageSweepStagger: 0.35,    // розкид затримок між шматками, с
-    collagePileMax: 60,           // ліміт шматків у купі (найнижчі прибираються першими)
+    collageSweepScatter: 30,      // наскільки шматки розлітаються в різні боки від напряму змітання, °
+    collagePileMax: 400,          // запобіжник: максимум шматків у купі (найнижчі прибираються лише понад цей ліміт)
+    collagePileCull: false,       // true = прибирати шматки, повністю закриті новими (за замовчуванням купа тільки росте)
     // 'fade' exit
     collageExitOpacity: 0,        // до якої прозорості розчиняються (0 = повністю зникають, 1 = без розчинення)
     collageExitFadeLength: 1,     // яку частину зникнення триває розчинення (0.2 = швидко на початку, 1 = рівномірно)
@@ -5503,13 +5505,8 @@ controls.onChange('backsideColor', (val) => {
       });
     });
 
-    // stacking order = order in the list (old pile at the bottom, new on top);
-    // renumbering keeps the pile's depth bounded no matter how long it grows
-    clItems.forEach((it, r) => {
-      it.baseZ = 0.02 + r * 0.006;
-      it.mesh.renderOrder = 1000 + r * 2;
-      it.shadow.renderOrder = 1000 + r * 2 - 1;
-    });
+    // stacking order = order in the list (old pile at the bottom, new on top)
+    clRenumber();
 
     if (restart) clStartIn();
   }
@@ -5551,6 +5548,23 @@ controls.onChange('backsideColor', (val) => {
     clItems.splice(idx, 1);
   }
   function clCullCovered() {
+    if (clExitGet('collagePileCull') === true) clCullHidden();
+    // safety limit only: the very bottom of the pile goes first
+    const max = Math.max(5, Math.round(clExitNum('collagePileMax')));
+    while (clItems.length > max && clItems[0].settled) clRemoveItem(0);
+    clRenumber();
+  }
+  function clRenumber() {
+    // pile: thin layers so a tall pile doesn't creep towards the camera
+    const step = clExitStyle() === 'pile' ? 0.002 : 0.006;
+    clItems.forEach((it, r) => {
+      it.baseZ = 0.02 + r * step;
+      it.zStep = step;
+      it.mesh.renderOrder = 1000 + r * 2;
+      it.shadow.renderOrder = 1000 + r * 2 - 1;
+    });
+  }
+  function clCullHidden() {
     const { hw, hh } = clViewHalf();
     const G = 7;
     for (let a = clItems.length - 1; a >= 0; a--) {
@@ -5576,14 +5590,6 @@ controls.onChange('backsideColor', (val) => {
       }
       if (covered) clRemoveItem(a);
     }
-    // hard limit: the very bottom of the pile goes first
-    const max = Math.max(5, Math.round(clExitNum('collagePileMax')));
-    while (clItems.length > max && clItems[0].settled) clRemoveItem(0);
-    clItems.forEach((it, r) => {
-      it.baseZ = 0.02 + r * 0.006;
-      it.mesh.renderOrder = 1000 + r * 2;
-      it.shadow.renderOrder = 1000 + r * 2 - 1;
-    });
   }
 
   let clPhase = 'in';
@@ -5597,14 +5603,20 @@ controls.onChange('backsideColor', (val) => {
   function clStartOut() {
     if (!clItems.length) { clStartIn(); return; }
     clPhase = 'out'; clOutTime = 0;
-    // sweep: the hand reaches the pieces on its side first
-    const a = THREE.MathUtils.degToRad(clExitNum('collageSweepAngle'));
-    const dx = Math.cos(a), dy = Math.sin(a);
-    let lo = Infinity, hi = -Infinity;
-    clItems.forEach((it) => { it.proj = it.x * dx + it.y * dy; lo = Math.min(lo, it.proj); hi = Math.max(hi, it.proj); });
-    const span = Math.max(1e-3, hi - lo);
+    // sweep: the piece that landed LAST (top of the pile) leaves first, then the
+    // ones below it — so a moving piece never has to pass through one lying on
+    // top of it. Each piece gets its own direction around the sweep angle.
+    const n = clItems.length;
     const st = Math.max(0, clExitNum('collageSweepStagger'));
-    clItems.forEach((it) => { it.sweepDelay = (1 - (it.proj - lo) / span) * st; });
+    const base = THREE.MathUtils.degToRad(clExitNum('collageSweepAngle'));
+    const sc = THREE.MathUtils.degToRad(Math.max(0, clExitNum('collageSweepScatter')));
+    clItems.forEach((it, r) => {
+      const fromTop = n > 1 ? (n - 1 - r) / (n - 1) : 0;
+      it.sweepDelay = fromTop * st;
+      it.sweepAng = base + (Math.random() - 0.5) * 2 * sc;
+      it.sweepFar = 0.85 + Math.random() * 0.45;
+      it.sweepSpin = (Math.random() - 0.5) * 2;
+    });
   }
 
   function clInTotal() {
@@ -5749,12 +5761,13 @@ controls.onChange('backsideColor', (val) => {
           const sd = Math.max(0.05, clExitNum('collageSweepDuration'));
           const qs = clClamp01((tOut - it.sweepDelay) / sd);
           const es = qs * qs * (1.6 - 0.6 * qs);
-          const a = THREE.MathUtils.degToRad(clExitNum('collageSweepAngle'));
+          const a = it.sweepAng !== undefined ? it.sweepAng : THREE.MathUtils.degToRad(clExitNum('collageSweepAngle'));
           const { hw, hh } = clViewHalf();
-          const far = Math.hypot(hw, hh) * 2.2 + Math.max(it.w, it.h);
+          const far = (Math.hypot(hw, hh) * 2.2 + Math.max(it.w, it.h)) * (it.sweepFar || 1);
           x += Math.cos(a) * far * es;
           y += Math.sin(a) * far * es;
-          z += Math.sin(Math.PI * Math.min(1, qs * 1.4)) * 0.12;   // lifted slightly by the push
+          // stays at its own height in the pile: it slides UNDER pieces still
+          // lying on top instead of cutting through them
           rz += it.sweepSpin * 0.9 * es;
         } else {
           const od = Math.max(0.05, clExitNum('collageExitDuration'));
@@ -5776,6 +5789,11 @@ controls.onChange('backsideColor', (val) => {
       it.shadow.visible = visible && shadowK > 0.001;
       if (!visible) continue;
 
+      // the pile's own height must not read as perspective: compensate the
+      // resting depth so every piece keeps its on-screen size and place
+      const camD = camera.position.distanceTo(orbitControls.target) || 7.2;
+      const pk = Math.max(0.5, (camD - it.baseZ) / camD);
+      x *= pk; y *= pk; sc *= pk;
       it.mesh.position.set(x, y, z);
       it.mesh.rotation.set(rx, ry, rz);
       it.mesh.scale.set(it.w * sc, it.h * sc, 1);
@@ -5784,7 +5802,8 @@ controls.onChange('backsideColor', (val) => {
       const height = Math.max(0, z - it.baseZ);
       const off = 0.035 + height * 0.3;
       const blurW = 0.02 + height * 0.14;
-      it.shadow.position.set(x + shX * off, y + shY * off, it.baseZ - 0.003);
+      // shadow sits between this piece and the one below it
+      it.shadow.position.set(x + shX * off, y + shY * off, it.baseZ - (it.zStep || 0.006) * 0.5);
       it.shadow.rotation.set(0, 0, rz);
       it.shadow.scale.set(it.w * sc * CL_SHADOW_PAD, it.h * sc * CL_SHADOW_PAD, 1);
       const su = it.shadow.material.uniforms;
