@@ -5676,10 +5676,12 @@ controls.onChange('backsideColor', (val) => {
     showcaseStepDrift: 0.18,     // частка руху, що йде безперервно (картки ніколи не зупиняються повністю)
     showcaseStepAngle: 33,       // нахил діагоналі, °
     showcaseStepSpacing: 1.0,    // відстань між картками
-    showcaseStepTilt: 14,        // нахил кожного місця в ланцюжку, °
+    showcaseStepTilt: 6,         // випадковий нахил кожного місця в ланцюжку, °
+    showcaseStepSpin: 15,        // на скільки градусів картка прокручується за кожне місце (як на референсі)
     showcaseStepStagger: 0.025,  // затримка між картками на кроці, с
     showcaseStepDirection: 1,    // 1 = вгору-ліворуч, -1 = вниз-праворуч
-    showcaseStepGap: 0.45,       // відстань між картками в глибину (щоб не провалювались одна в одну)
+    showcaseStepGap: 0.45,
+    showcaseStepPlaces: 1,       // на скільки місць ланцюжка картки переїжджають за один крок (ширина кроку)       // відстань між картками в глибину (щоб не провалювались одна в одну)
     showcaseCount: 12,
     showcaseSpeed: 0.35,
     showcaseCardSize: 1.5,
@@ -5981,18 +5983,21 @@ controls.onChange('backsideColor', (val) => {
         const dirSign = scNum('showcaseStepDirection') < 0 ? -1 : 1;
         // which place this card is heading for (unwrapped)
         const baseSlot = i - (n - 1) / 2;
-        const steps = Math.floor(scStepClock / cycle);
-        // stagger: cards further along the chain start a hair later
-        const rank = (((i - dirSign * steps) % n) + n) % n;
-        const local = scStepClock - steps * cycle - Math.max(0, stagger) * rank;
-        const eStep = local <= 0 ? 0 : (local < moveD ? easeFn(local / moveD) : 1);
+        // stagger: every card runs the same hop schedule, shifted by a FIXED
+        // delay along the chain (card order in the chain never changes), so a
+        // big stagger makes a wave instead of jumps
+        const cardClock = scStepClock - Math.max(0, stagger) * (dirSign > 0 ? i : (n - 1 - i));
+        const steps = Math.floor(cardClock / cycle);
+        const local = cardClock - steps * cycle;
+        const eStep = local < moveD ? easeFn(local / moveD) : 1;
         // part of the travel is a constant slow glide, so cards never freeze
         // completely between hops; still exactly one place per cycle
         const drift = Math.min(0.6, Math.max(0, scNum('showcaseStepDrift')));
-        const glide = Math.min(1, Math.max(0, (scStepClock - steps * cycle) / cycle));
+        const glide = local / cycle;
         const e = (1 - drift) * eStep + drift * glide;
         // position along the chain, wrapped so the chain loops endlessly
-        let sPos = baseSlot - dirSign * (steps + e);
+        const hop = Math.max(0.25, scNum('showcaseStepPlaces'));
+        let sPos = baseSlot - dirSign * (steps + e) * hop;
         const half = n / 2;
         sPos = ((sPos + half) % n + n) % n - half;
         const ang = THREE.MathUtils.degToRad(scNum('showcaseStepAngle'));
@@ -6045,7 +6050,12 @@ controls.onChange('backsideColor', (val) => {
         const k0 = Math.floor(sp), fl = sp - k0;
         const f = fl * fl * (3 - 2 * fl);   // smooth hand-over between the angles of two places
         const tiltDeg = scNum('showcaseStepTilt');
-        const tiltZ = THREE.MathUtils.degToRad(tiltDeg) * 2 * scLerp(scSlotTilt(k0, seed), scSlotTilt(k0 + 1, seed), f);
+        // steady spin: the angle changes linearly along the chain, so every hop
+        // turns the card by the same amount (measured ~15° per place in the
+        // reference: bottom-right cards lean clockwise, they unwind while
+        // travelling to the top-left)
+        const spin = THREE.MathUtils.degToRad(scNum('showcaseStepSpin')) * -sp;
+        const tiltZ = spin + THREE.MathUtils.degToRad(tiltDeg) * 2 * scLerp(scSlotTilt(k0, seed), scSlotTilt(k0 + 1, seed), f);
         const yaw = 0.2 * rotAmt * 2 * scLerp(scSlotYaw(k0, seed), scSlotYaw(k0 + 1, seed), f);
         scEuler.set(0.06 * rotAmt * Math.sin(wobT * 0.3), yaw, tiltZ + (cd.r5 - 0.5) * 0.12 * rotAmt);
       } else {
