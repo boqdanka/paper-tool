@@ -5242,6 +5242,18 @@ controls.onChange('backsideColor', (val) => {
   if (controls.get('collageStartOpacity') === undefined) controls.set('collageStartOpacity', 0);
   if (controls.get('collageFadeDuration') === undefined) controls.set('collageFadeDuration', 0.12);
   controls.setDefaults({ collageStartOpacity: 0, collageFadeDuration: 0.12 });
+  const CL_EXIT_DEFAULTS = {
+    collageExitStyle: 'fade',     // 'fade' (злітають і розчиняються) | 'sweep' (змітаються вбік) | 'pile' (засипаються новою композицією)
+    collageSweepAngle: 0,         // куди змітає рука, ° (0 = праворуч, 90 = вгору, 180 = ліворуч)
+    collageSweepDuration: 0.6,    // як довго виїжджає один шматок, с
+    collageSweepStagger: 0.35,    // розкид затримок між шматками, с
+    collagePileMax: 60,           // ліміт шматків у купі (найнижчі прибираються першими)
+  };
+  Object.keys(CL_EXIT_DEFAULTS).forEach((k) => { if (controls.get(k) === undefined) controls.set(k, CL_EXIT_DEFAULTS[k]); });
+  controls.setDefaults(CL_EXIT_DEFAULTS);
+  const clExitGet = (k) => { const v = controls.get(k); return v === undefined || v === null ? CL_EXIT_DEFAULTS[k] : v; };
+  const clExitNum = (k) => { const v = Number(clExitGet(k)); return isFinite(v) ? v : CL_EXIT_DEFAULTS[k]; };
+  const clExitStyle = () => { const v = clExitGet('collageExitStyle'); return v === 'sweep' || v === 'pile' ? v : 'fade'; };
 
   const CL_EASE = {
     back: (x) => { const c1 = 1.9; const c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); },
@@ -5377,8 +5389,9 @@ controls.onChange('backsideColor', (val) => {
     return { hw: halfH * camera.aspect, hh: halfH };
   }
 
-  function clRelayout(restart) {
-    clClearItems();
+  function clRelayout(restart, keepOld) {
+    if (keepOld) clItems.forEach((it) => { it.settled = true; });
+    else clClearItems();
     const texs = clSources().filter((t) => clTexSize(t));
     if (!texs.length) return;
 
@@ -5466,7 +5479,9 @@ controls.onChange('backsideColor', (val) => {
       clGroup.add(mesh);
 
       clItems.push({
-        mesh, shadow, w, h, x, y, rot, style,
+        mesh, shadow, w, h, x, y, rot, style, tex,
+        k: i, settled: false,
+        sweepDelay: 0, sweepSpin: (rng() - 0.5) * 2,
         baseZ: 0.02 + i * 0.006,
         spin: (rng() - 0.5) * 1.4,
         tiltX: (rng() - 0.5) * 0.9,
@@ -5477,7 +5492,87 @@ controls.onChange('backsideColor', (val) => {
       });
     });
 
+    // stacking order = order in the list (old pile at the bottom, new on top);
+    // renumbering keeps the pile's depth bounded no matter how long it grows
+    clItems.forEach((it, r) => {
+      it.baseZ = 0.02 + r * 0.006;
+      it.mesh.renderOrder = 1000 + r * 2;
+      it.shadow.renderOrder = 1000 + r * 2 - 1;
+    });
+
     if (restart) clStartIn();
+  }
+
+  // ---- 'pile': remove pieces that are completely hidden under newer ones ----
+  const clMaskCache = new Map();
+  function clMask(tex) {
+    if (clMaskCache.has(tex)) return clMaskCache.get(tex);
+    let mask = null;
+    try {
+      const S = 32;
+      const cv = document.createElement('canvas');
+      cv.width = S; cv.height = S;
+      const cx = cv.getContext('2d', { willReadFrequently: true });
+      cx.drawImage(tex.image, 0, 0, S, S);
+      const d = cx.getImageData(0, 0, S, S).data;
+      mask = { S, a: new Uint8Array(S * S) };
+      for (let i = 0; i < S * S; i++) mask.a[i] = d[i * 4 + 3];
+    } catch (e) { mask = null; }          // unreadable image -> treat as opaque
+    clMaskCache.set(tex, mask);
+    return mask;
+  }
+  function clOpaqueAt(it, u, v) {        // u,v in 0..1 of the piece (v up)
+    const m = clMask(it.tex);
+    if (!m) return true;
+    const px = Math.min(m.S - 1, Math.max(0, Math.floor(u * m.S)));
+    const py = Math.min(m.S - 1, Math.max(0, Math.floor((1 - v) * m.S)));
+    return m.a[py * m.S + px] > 128;
+  }
+  function clLocalUV(it, wx, wy) {
+    const c = Math.cos(-it.rot), sn = Math.sin(-it.rot);
+    const dx = wx - it.x, dy = wy - it.y;
+    return [(dx * c - dy * sn) / it.w + 0.5, (dx * sn + dy * c) / it.h + 0.5];
+  }
+  function clRemoveItem(idx) {
+    const it = clItems[idx];
+    clGroup.remove(it.mesh); clGroup.remove(it.shadow);
+    it.mesh.material.dispose(); it.shadow.material.dispose();
+    clItems.splice(idx, 1);
+  }
+  function clCullCovered() {
+    const { hw, hh } = clViewHalf();
+    const G = 7;
+    for (let a = clItems.length - 1; a >= 0; a--) {
+      const A = clItems[a];
+      if (!A.settled) continue;
+      let covered = true;
+      for (let gy = 0; gy < G && covered; gy++) {
+        for (let gx = 0; gx < G && covered; gx++) {
+          const u = (gx + 0.5) / G, v = (gy + 0.5) / G;
+          if (!clOpaqueAt(A, u, v)) continue;
+          const lx = (u - 0.5) * A.w, ly = (v - 0.5) * A.h;
+          const c = Math.cos(A.rot), sn = Math.sin(A.rot);
+          const wx = A.x + lx * c - ly * sn, wy = A.y + lx * sn + ly * c;
+          if (Math.abs(wx) > hw * 1.05 || Math.abs(wy) > hh * 1.05) continue;   // off-screen: nobody sees it
+          let hit = false;
+          for (let b = a + 1; b < clItems.length && !hit; b++) {
+            const B = clItems[b];
+            const [bu, bv] = clLocalUV(B, wx, wy);
+            if (bu >= 0 && bu <= 1 && bv >= 0 && bv <= 1 && clOpaqueAt(B, bu, bv)) hit = true;
+          }
+          if (!hit) covered = false;
+        }
+      }
+      if (covered) clRemoveItem(a);
+    }
+    // hard limit: the very bottom of the pile goes first
+    const max = Math.max(5, Math.round(clExitNum('collagePileMax')));
+    while (clItems.length > max && clItems[0].settled) clRemoveItem(0);
+    clItems.forEach((it, r) => {
+      it.baseZ = 0.02 + r * 0.006;
+      it.mesh.renderOrder = 1000 + r * 2;
+      it.shadow.renderOrder = 1000 + r * 2 - 1;
+    });
   }
 
   let clPhase = 'in';
@@ -5486,23 +5581,40 @@ controls.onChange('backsideColor', (val) => {
   const CL_OUT_DUR = 0.35;
   const CL_OUT_STAGGER = 0.045;
 
-  function clStartIn() { clPhase = 'in'; clTime = 0; clOutTime = 0; }
-  function clStartOut() { if (clItems.length) { clPhase = 'out'; clOutTime = 0; } else clStartIn(); }
+  let clCulled = false;
+  function clStartIn() { clPhase = 'in'; clTime = 0; clOutTime = 0; clCulled = false; }
+  function clStartOut() {
+    if (!clItems.length) { clStartIn(); return; }
+    clPhase = 'out'; clOutTime = 0;
+    // sweep: the hand reaches the pieces on its side first
+    const a = THREE.MathUtils.degToRad(clExitNum('collageSweepAngle'));
+    const dx = Math.cos(a), dy = Math.sin(a);
+    let lo = Infinity, hi = -Infinity;
+    clItems.forEach((it) => { it.proj = it.x * dx + it.y * dy; lo = Math.min(lo, it.proj); hi = Math.max(hi, it.proj); });
+    const span = Math.max(1e-3, hi - lo);
+    const st = Math.max(0, clExitNum('collageSweepStagger'));
+    clItems.forEach((it) => { it.sweepDelay = (1 - (it.proj - lo) / span) * st; });
+  }
 
   function clInTotal() {
-    return Math.max(0, clItems.length - 1) * Math.max(0, clGet('collageStagger')) + Math.max(0.05, clGet('collageDuration'));
+    const n = clItems.filter((it) => !it.settled).length;
+    return Math.max(0, n - 1) * Math.max(0, clGet('collageStagger')) + Math.max(0.05, clGet('collageDuration'));
   }
   function clOutTotal() {
+    if (clExitStyle() === 'sweep') return Math.max(0, clExitNum('collageSweepStagger')) + Math.max(0.05, clExitNum('collageSweepDuration'));
     return Math.max(0, clItems.length - 1) * CL_OUT_STAGGER + CL_OUT_DUR;
   }
 
-  function clNextComposition() {
+  function clNextComposition(keepOld) {
     if (clGet('collageRandomizeOnReplay')) clSeed = Math.floor(Math.random() * 100000) + 1;
-    clRelayout(true);
+    clRelayout(true, !!keepOld);
   }
 
   let clPendingNew = true;
-  function clReplay() { clStartOut(); clPendingNew = true; }
+  function clReplay() {
+    if (clExitStyle() === 'pile') { clNextComposition(true); return; }
+    clStartOut(); clPendingNew = true;
+  }
 
   controls.onAction('replayCollage', clReplay);
   controls.onAction('shuffleCollage', () => {
@@ -5545,11 +5657,18 @@ controls.onChange('backsideColor', (val) => {
     if (!clItems.length) return;
 
     const autoReplay = clGet('collageAutoReplay') && controls.get('animTrigger') !== 'click';
+    const exitStyle = clExitStyle();
     if (clPhase === 'in') {
       clTime += dt;
+      // 'pile': once the new layer has landed, drop what it fully hides
+      if (exitStyle === 'pile' && !clCulled && clTime > clInTotal() + 0.05) { clCullCovered(); clCulled = true; }
       if (autoReplay && clTime > clInTotal() + Math.max(0, clGet('collageHold'))) {
-        clStartOut();
-        clPendingNew = true;
+        if (exitStyle === 'pile') {
+          clNextComposition(true);          // new pieces fall on top of the old pile
+        } else {
+          clStartOut();
+          clPendingNew = true;
+        }
       }
     } else {
       clOutTime += dt;
@@ -5582,7 +5701,7 @@ controls.onChange('backsideColor', (val) => {
     const n = clItems.length;
     for (let i = 0; i < n; i++) {
       const it = clItems[i];
-      const p = clClamp01((tIn - i * stagger) / dur);
+      const p = it.settled ? 1 : clClamp01((tIn - it.k * stagger) / dur);
 
       let x = it.x, y = it.y, z = it.baseZ;
       let rz = it.rot, rx = 0, ry = 0, sc = 1, op = 0;
@@ -5614,11 +5733,25 @@ controls.onChange('backsideColor', (val) => {
       }
 
       if (clPhase === 'out') {
-        const qo = clClamp01((tOut - (n - 1 - i) * CL_OUT_STAGGER) / CL_OUT_DUR);
-        const eo = qo * qo * qo;
-        z += eo * 3.0;
-        rz += eo * it.spin * 0.6;
-        op *= 1 - qo;
+        if (exitStyle === 'sweep') {
+          // swept off the table by a hand: accelerate out of frame, turning a bit
+          const sd = Math.max(0.05, clExitNum('collageSweepDuration'));
+          const qs = clClamp01((tOut - it.sweepDelay) / sd);
+          const es = qs * qs * (1.6 - 0.6 * qs);
+          const a = THREE.MathUtils.degToRad(clExitNum('collageSweepAngle'));
+          const { hw, hh } = clViewHalf();
+          const far = Math.hypot(hw, hh) * 2.2 + Math.max(it.w, it.h);
+          x += Math.cos(a) * far * es;
+          y += Math.sin(a) * far * es;
+          z += Math.sin(Math.PI * Math.min(1, qs * 1.4)) * 0.12;   // lifted slightly by the push
+          rz += it.sweepSpin * 0.9 * es;
+        } else {
+          const qo = clClamp01((tOut - (n - 1 - i) * CL_OUT_STAGGER) / CL_OUT_DUR);
+          const eo = qo * qo * qo;
+          z += eo * 3.0;
+          rz += eo * it.spin * 0.6;
+          op *= 1 - qo;
+        }
       }
 
       const visible = op > 0.001;
