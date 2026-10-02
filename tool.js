@@ -12,7 +12,7 @@ THREE.ColorManagement.enabled = false;
 
 // Version stamp — visible in the browser console, so it's easy to see which
 // tool.js Brik actually loaded.
-window.PAPER_TOOL_VERSION = '2026-10-02 · v9 (no card cut-through in steps)';
+window.PAPER_TOOL_VERSION = '2026-10-02 · v11 (crumple uses your poster)';
 console.info('%c[paper-tool] loaded ' + window.PAPER_TOOL_VERSION, 'background:#ffd23f;color:#111;padding:2px 6px;border-radius:3px');
 
 // Setup render area and Three.js scene
@@ -5253,6 +5253,12 @@ controls.onChange('backsideColor', (val) => {
     collageSweepDuration: 0.6,    // як довго виїжджає один шматок, с
     collageSweepStagger: 0.35,    // розкид затримок між шматками, с
     collagePileMax: 60,           // ліміт шматків у купі (найнижчі прибираються першими)
+    // 'fade' exit
+    collageExitOpacity: 0,        // до якої прозорості розчиняються (0 = повністю зникають, 1 = без розчинення)
+    collageExitFadeLength: 1,     // яку частину зникнення триває розчинення (0.2 = швидко на початку, 1 = рівномірно)
+    collageExitLift: 1,           // наскільки високо злітають (0 = розчиняються на місці)
+    collageExitDuration: 0.35,    // тривалість зникнення одного шматка, с
+    collageExitStagger: 0.045,    // затримка між шматками, с
   };
   Object.keys(CL_EXIT_DEFAULTS).forEach((k) => { if (controls.get(k) === undefined) controls.set(k, CL_EXIT_DEFAULTS[k]); });
   controls.setDefaults(CL_EXIT_DEFAULTS);
@@ -5607,7 +5613,7 @@ controls.onChange('backsideColor', (val) => {
   }
   function clOutTotal() {
     if (clExitStyle() === 'sweep') return Math.max(0, clExitNum('collageSweepStagger')) + Math.max(0.05, clExitNum('collageSweepDuration'));
-    return Math.max(0, clItems.length - 1) * CL_OUT_STAGGER + CL_OUT_DUR;
+    return Math.max(0, clItems.length - 1) * Math.max(0, clExitNum('collageExitStagger')) + Math.max(0.05, clExitNum('collageExitDuration'));
   }
 
   function clNextComposition(keepOld) {
@@ -5751,11 +5757,17 @@ controls.onChange('backsideColor', (val) => {
           z += Math.sin(Math.PI * Math.min(1, qs * 1.4)) * 0.12;   // lifted slightly by the push
           rz += it.sweepSpin * 0.9 * es;
         } else {
-          const qo = clClamp01((tOut - (n - 1 - i) * CL_OUT_STAGGER) / CL_OUT_DUR);
+          const od = Math.max(0.05, clExitNum('collageExitDuration'));
+          const ost = Math.max(0, clExitNum('collageExitStagger'));
+          const qo = clClamp01((tOut - (n - 1 - i) * ost) / od);
           const eo = qo * qo * qo;
-          z += eo * 3.0;
-          rz += eo * it.spin * 0.6;
-          op *= 1 - qo;
+          const lift = Math.max(0, clExitNum('collageExitLift'));
+          z += eo * 3.0 * lift;
+          rz += eo * it.spin * 0.6 * Math.min(1, lift);
+          const endOp = clClamp01(clExitNum('collageExitOpacity'));
+          const fl = Math.max(0.02, Math.min(1, clExitNum('collageExitFadeLength')));
+          const qf = clClamp01(qo / fl);
+          op *= 1 - qf * (1 - endOp);
         }
       }
 
@@ -6225,6 +6237,24 @@ controls.onChange('backsideColor', (val) => {
     glslCommonUniforms.uStockType.value = getStockTypeCode(activePaperPreset);
 
     mainStage.updateMatrixWorld(true);
+  };
+}
+
+// =========================================================================
+// keep the main poster texture bound in fold / crumple every frame (they only
+// got it once when the images finished loading, which could be missed when the
+// panel sends the images after the tool started)
+// =========================================================================
+{
+  const mtPrevHook = scene.onBeforeRender;
+  scene.onBeforeRender = function (r, sc, cam, rt) {
+    if (typeof mtPrevHook === 'function') mtPrevHook.call(this, r, sc, cam, rt);
+    const mode = controls.get('mode');
+    if (mode !== 'crumple' && mode !== 'fold') return;
+    const tex = getActiveTexturesList()[0];
+    if (!tex) return;
+    if (mode === 'crumple' && crumpleUniforms.uTexture.value !== tex) crumpleUniforms.uTexture.value = tex;
+    if (mode === 'fold' && foldUniforms.uTexture.value !== tex) foldUniforms.uTexture.value = tex;
   };
 }
 
