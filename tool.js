@@ -3780,13 +3780,18 @@ controls.onChange('backsideColor', (val) => {
       vec2 uv = (vUv - 0.5) * uPad + 0.5;
       float a = 0.0;
       float tot = 0.0;
+      // each tap reads a pre-blurred mip level as wide as the tap spacing, so a
+      // wide blur stays smooth instead of breaking into stepped copies
+      vec2 ts = vec2(textureSize(uTexture, 0));
+      vec2 stepUv = uBlur * 0.5;
+      float lod = log2(max(1.0, max(stepUv.x * ts.x, stepUv.y * ts.y)) * 1.5);
       for (int x = -2; x <= 2; x++) {
         for (int y = -2; y <= 2; y++) {
           vec2 o = vec2(float(x), float(y));
-          float w = 1.0 / (1.0 + dot(o, o));
-          vec2 s = uv + o * uBlur;
+          float w = exp(-dot(o, o) * 0.35);
+          vec2 s = uv + o * stepUv;
           float inb = step(0.0, s.x) * step(s.x, 1.0) * step(0.0, s.y) * step(s.y, 1.0);
-          a += texture2D(uTexture, s).a * inb * w;
+          a += textureLod(uTexture, clamp(s, 0.0, 1.0), lod).a * inb * w;
           tot += w;
         }
       }
@@ -4090,12 +4095,14 @@ controls.onChange('backsideColor', (val) => {
 
       const height = Math.max(0, z - it.baseZ);
       const off = 0.035 + height * 0.3;
-      const blurW = 0.018 + height * 0.1;
+      const blurW = 0.02 + height * 0.14;
       it.shadow.position.set(x + shX * off, y + shY * off, it.baseZ - 0.003);
       it.shadow.rotation.set(0, 0, rz);
       it.shadow.scale.set(it.w * sc * CL_SHADOW_PAD, it.h * sc * CL_SHADOW_PAD, 1);
       const su = it.shadow.material.uniforms;
-      su.uOpacity.value = shadowK * op * 0.6 / (1 + height * 1.2);
+      // a piece high above the table casts only a faint, wide shadow that
+      // gathers as it lands (matters when pieces fall in fully opaque)
+      su.uOpacity.value = shadowK * op * 0.6 * Math.exp(-height * 1.3);
       su.uBlur.value.set(blurW / Math.max(0.01, it.w * sc), blurW / Math.max(0.01, it.h * sc));
     }
 
